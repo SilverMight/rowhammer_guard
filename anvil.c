@@ -12,6 +12,7 @@
 #include <linux/err.h>
 #include <linux/percpu.h>
 #include <linux/mm.h>
+#include <linux/io.h>
 #include <linux/highmem.h>
 #include <linux/sched.h>
 #include <asm/page.h>
@@ -119,14 +120,11 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 {
 	unsigned long phys;
 	struct page *pg;
-	int ret = get_user_pages ( NULL,
- 								mm,
- 								virt,
- 								1,
- 								0,
- 								0,
- 								&pg,
- 								NULL);
+	int ret = get_user_pages (
+		virt,
+		1,
+		0,
+		&pg);
 
 	if(ret <= 0)
 		return 0;
@@ -164,7 +162,7 @@ void load_latency_callback(struct perf_event *event,
 
 #ifdef DEBUG
 	sample_buffer[sample_head].addr = data->addr;
-	sample_buffer[sample_head].lat = data->weight;
+	sample_buffer[sample_head].lat = data->weight.full;
 #endif
 
 	/* limit sample index */
