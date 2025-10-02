@@ -20,11 +20,10 @@
 #include <linux/delay.h>
 
 #include "anvil.h"
+#include "dram_mapping.h"
 
 #define MIN_SAMPLES 0
 #define REFRESHED_ROWS 1
-
-#define get_bank(page) ((page>>2)&7)^((page>>6)&7)
 
 MODULE_LICENSE("GPL");
 
@@ -75,40 +74,6 @@ void l1D_event_callback(struct perf_event *event,
             struct perf_sample_data *data,
             struct pt_regs *regs){}
 
-/* returns a pfn of a page "inc" rows above the page "phy" in a base row */ 
-/*@input: phy - physical page in base DRAM row
-@input: inc - offset to the base row
-
-@return: pfn of page in the row base row - inc
-*/
-
-static unsigned long get_row_plus(unsigned long phy, int inc){
-	unsigned long bank_old = get_bank(phy);
-	unsigned long row_new = (phy>>6) + inc;
-	unsigned long bank_new = (row_new & 0x7) ^ bank_old;
-	unsigned long rank_new = (phy>>7)&1;
-
-	return (unsigned long)((row_new << 6) | (rank_new << 5) | (bank_new << 2) | (phy & 0x3));
-
-}
-
-/* returns a pfn of a page "dec" rows below the page "phy" in a base row */ 
-/*@input: phy - physical page in base DRAM row
-@input: dec - offset to the base row
-
-@return: pfn of page in the row base row - dec
-*/
-
-static unsigned long get_row_minus(unsigned long phy, int dec){
-	unsigned long bank_old = get_bank(phy);
-	unsigned long row_new = (phy>>6) - dec;
-	unsigned long bank_new = (row_new & 0x7) ^ bank_old;
-	unsigned long rank_new = (phy>>7)&1;
-
-return  (unsigned long)((row_new << 6) | (rank_new << 5) | (bank_new << 2) | (phy & 0x3));
-
-}
-
 
 /* convert virtual address from user process into physical address */
 /* @input: mm - memory discriptor user process
@@ -124,7 +89,9 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 		virt,
 		1,
 		0,
-		&pg);
+		&pg
+        ,NULL
+    );
 
 	if(ret <= 0)
 		return 0;
@@ -239,6 +206,7 @@ void action_wq_callback( struct work_struct *work)
 	int rec,log_;
 	unsigned long pfn1,pfn2;
 	unsigned long *virt;
+
 	struct page *pg1,*pg2;
 	int i;
 		
@@ -271,12 +239,12 @@ void action_wq_callback( struct work_struct *work)
 				/* potential hammering detected , deploy refresh */
 				for(i=1;i<=REFRESHED_ROWS;i++){
 				/* get page frame number for pages in rows above and below */
-					pfn1 = get_row_plus(profile[rec].phy_page,i);// pfn for victim row1
-					pfn2 = get_row_minus(profile[rec].phy_page,i);// pfn for victim row2
+                    pfn1 = dram_def->get_row_plus(profile[rec].phy_page,i);
+                    pfn2 = dram_def->get_row_minus(profile[rec].phy_page,i);
 
-					/* get physical page */
-					pg1 = pfn_to_page(pfn1);
-					pg2 = pfn_to_page(pfn2);
+
+                    pg1 = pfn_to_page(pfn1);
+                    pg2 = pfn_to_page(pfn2);
 			
 					/* map pages to kernel space and refresh */
 					virt = (unsigned long*)kmap(pg1);
@@ -446,6 +414,14 @@ static void sort(void){
 static int start_init(void)
 {
 	int cpu;
+    int ret;
+
+    ret = detect_and_register_dram_mapping();
+    if(ret){
+            printk(KERN_ERR "Error detecting DRAM mapping\n");
+            return ret;
+    }
+
 	old_val = 0;
 	/* Setup LLC Miss event */
 	for_each_online_cpu(cpu){
