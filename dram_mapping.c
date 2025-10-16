@@ -3,15 +3,15 @@
 #include <asm/processor.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <asm/page_types.h>
 
 struct dram_mapping_ops* dram_def = NULL;
 EXPORT_SYMBOL(dram_def);
 
 static const struct dram_config* active_config = NULL;
 
-// TODO:: Does this need to be configurable? pretty sure 4K pages is the standard
-#define PFN_TO_PHYS(pfn) ((size_t)(pfn) << 12)
-#define PHYS_TO_PFN(phys) ((size_t)(phys) >> 12)
+#define PFN_TO_PHYS(pfn) ((size_t)(pfn) << PAGE_SHIFT)
+#define PHYS_TO_PFN(phys) ((size_t)(phys) >> PAGE_SHIFT)
 
 // 
 // GENERIC XOR-BASED DRAM MAPPING
