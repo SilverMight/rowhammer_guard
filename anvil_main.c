@@ -18,6 +18,9 @@
 #include <asm/page.h>
 #include <asm/uaccess.h>
 #include <linux/delay.h>
+#include <linux/version.h>
+#include <linux/version.h>
+
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -81,21 +84,50 @@ void l1D_event_callback(struct perf_event *event,
 
    @return: corresponding physical address of "virt" */
 
-static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
-{
-	unsigned long phys;
-	struct page *pg;
-	int ret = get_user_pages (
-		virt,
-		1,
-		0,
-		&pg
-        ,NULL
-    );
+// static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
+// {
+// 	unsigned long phys;
+// 	struct page *pg;
+// 	// int ret = get_user_pages (
+// 	// 	virt,
+// 	// 	1,
+// 	// 	0,
+// 	// 	&pg
+//     //     ,NULL
+//     // );
+// 	unsigned int gup_flags = FOLL_WRITE;
+// 	int ret = get_user_pages(
+// 		virt,
+// 		1,
+// 		gup_flags,
+// 		&pg,
+// 		NULL
+// 	);
 
-	if(ret <= 0)
+// 	if(ret <= 0)
+// 		return 0;
+// 	/* get physical address */
+// 	phys = page_to_phys(pg);
+// 	return phys;
+// }
+
+static unsigned long virt_to_phy(struct mm_struct *mm, unsigned long virt)
+{
+    unsigned long phys;
+    struct page *pg;
+    int ret;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+	/* Newer kernels (e.g., Ubuntu 6.14): 4-arg GUP */
+	ret = get_user_pages(virt, 1, FOLL_WRITE, &pg);
+#else
+	/* Older kernels (e.g., AlmaLinux 5.14): 5-arg GUP */
+	ret = get_user_pages(virt, 1, FOLL_WRITE, &pg, NULL);
+#endif
+
+	if (ret <= 0)
 		return 0;
-	/* get physical address */
+
 	phys = page_to_phys(pg);
 	return phys;
 }
