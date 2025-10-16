@@ -223,50 +223,55 @@ void action_wq_callback( struct work_struct *work)
 	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
 		printk("samples = %u\n",sample_total);
 		/* calculate hammer threshold */
-		hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
+        hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
 
-		/* check for potential agressors */
-		for(rec = 0;rec<record_size;rec++){
+        /* check for potential agressors */
+        for(rec = 0;rec<record_size;rec++){
 #ifdef DEBUG
-			profile[rec].hammer = 0;
+            profile[rec].hammer = 0;
 #endif
-			if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total>= MIN_SAMPLES)){
+            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total>= MIN_SAMPLES)){
 #ifdef DEBUG
-				log_ = 1;
-				profile[rec].hammer = 1;
-				L2_count++;
+                log_ = 1;
+                profile[rec].hammer = 1;
+                L2_count++;
 #endif
-				/* potential hammering detected , deploy refresh */
-				for(i=1;i<=REFRESHED_ROWS;i++){
-				/* get page frame number for pages in rows above and below */
+                /* potential hammering detected , deploy refresh */
+                for(i=1;i<=REFRESHED_ROWS;i++){
+                    /* get page frame number for pages in rows above and below */
                     pfn1 = dram_def->get_row_plus(profile[rec].phy_page,i);
                     pfn2 = dram_def->get_row_minus(profile[rec].phy_page,i);
 
+                    /* map pages to kernel space and refresh 
+                     * ensure page is not reserved or offline
+                    */
+                    pg1 = pfn_to_online_page(pfn1);
+                    if(pg1 && !PageReserved(pg1)) {
+                        virt = (unsigned long*)kmap(pg1);
+                        if(virt){
+                            asm volatile("clflush (%0)"::"r"(virt):"memory");
+                            get_user(profile[rec].dummy1,virt);
+                            kunmap(pg1);
+                        }
+                    }
 
-                    pg1 = pfn_to_page(pfn1);
-                    pg2 = pfn_to_page(pfn2);
-			
-					/* map pages to kernel space and refresh */
-					virt = (unsigned long*)kmap(pg1);
-					if(virt){
-						asm volatile("clflush (%0)"::"r"(virt):"memory");
-						get_user(profile[rec].dummy1,virt);
-						kunmap(pg1);
-					}
+                    pg2 = pfn_to_online_page(pfn2);
+                    if(pg2 && !PageReserved(pg2)) {
+                        virt = (unsigned long*)kmap(pg2);
+                        if(virt){
+                            asm volatile("clflush (%0)"::"r"(virt):"memory");
+                            get_user(profile[rec].dummy2,virt);
+                            kunmap(pg2);
+                        }
+                    }
+                }
 
-					virt = (unsigned long*)kmap(pg2);
-					if(virt){
-						asm volatile("clflush (%0)"::"r"(virt):"memory");
-						get_user(profile[rec].dummy2,virt);
-						kunmap(pg2);
-					}
-				}
+            }
 #ifdef DEBUG
-				refresh_count++;
+            refresh_count++;
 #endif
-			}
-		}
-	}
+        }
+    }
 
 #ifdef DEBUG
 	if(log_){
