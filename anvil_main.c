@@ -85,13 +85,14 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 {
 	unsigned long phys;
 	struct page *pg;
-	int ret = get_user_pages (
-		virt,
-		1,
-		0,
-		&pg
-        ,NULL
-    );
+
+	int ret;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
+    ret = get_user_pages(virt, 1, FOLL_WRITE, &pg);
+#else
+    ret = get_user_pages(virt, 1, FOLL_WRITE, &pg, NULL);
+#endif
 
 	if(ret <= 0)
 		return 0;
