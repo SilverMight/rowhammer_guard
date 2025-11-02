@@ -9,19 +9,17 @@ EXPORT_SYMBOL(dram_def);
 
 static const struct dram_config* active_config = NULL;
 
-// TODO:: Does this need to be configurable? pretty sure 4K pages is the standard
 #define PFN_TO_PHYS(pfn) ((size_t)(pfn) << 12)
 #define PHYS_TO_PFN(phys) ((size_t)(phys) >> 12)
 
-// 
-// GENERIC XOR-BASED DRAM MAPPING
-//
+/* --------------------------------------------------------------
+ * Helper: Apply XOR matrix to linearize DRAM address
+ * -------------------------------------------------------------- */
 static size_t apply_matrix(const size_t* matrix, unsigned int size, size_t addr) {
     size_t result = 0;
     int i;
     for (i = 0; i < size; ++i) {
         result <<= 1;
-        // hweight_long & 1 is equivalent to __builtin_parityl
         result |= (hweight_long(matrix[i] & addr) & 1);
     }
     return result;
@@ -47,11 +45,11 @@ static size_t generic_get_column(size_t pfn) {
 }
 
 static size_t generic_get_rank(size_t pfn) {
-    return 0; 
+    return 0;
 }
 
 static size_t get_pfn_from_dram_coords(size_t bank, size_t row, size_t col) {
-    size_t linearized_addr = 
+    size_t linearized_addr =
         ((bank & active_config->bank_mask) << active_config->bank_shift) |
         ((row & active_config->row_mask) << active_config->row_shift) |
         ((col & active_config->column_mask) << active_config->column_shift);
@@ -67,7 +65,6 @@ static size_t generic_get_row_minus(size_t pfn, int dec) {
     return get_pfn_from_dram_coords(generic_get_bank(pfn), generic_get_row(pfn) - dec, generic_get_column(pfn));
 }
 
-
 static struct dram_mapping_ops generic_dram_ops = {
     .get_bank = generic_get_bank,
     .get_row = generic_get_row,
@@ -77,45 +74,62 @@ static struct dram_mapping_ops generic_dram_ops = {
     .get_row_minus = generic_get_row_minus,
 };
 
+/* --------------------------------------------------------------
+ * Detect CPU and register mapping
+ * -------------------------------------------------------------- */
 int detect_and_register_dram_mapping(void)
 {
+    struct cpuinfo_x86 *c = &boot_cpu_data;
 
-        struct cpuinfo_x86 *c = &boot_cpu_data;
-
+    /* Intel mappings */
     if (c->x86_vendor == X86_VENDOR_INTEL && c->x86 == 6) {
         switch (c->x86_model) {
-            case 0x9E: // Coffee Lake
-            case 0x97: 
-                // TODO: add coffee lake config
-                // active_config = &intel_coffeelake_config;
-                break;
-            case 0xA5: // Comet Lake
+            case 0xA5: /* Comet Lake */
             case 0xA6:
                 active_config = &intel_cometlake_config;
                 break;
         }
     }
-    // TODO: Add AMD support
-    /* else if (c->x86_vendor == X86_VENDOR_AMD && c->x86 == 0x17) {
-        // Family 0x17 is Zen. Now check model.
-        switch (c->x86_model) {
-            case 0x71: // Zen 2 (e.g., Ryzen 5 3600)
-            case 0x60: // Zen 2 (e.g., Ryzen 5 5600G)
-                active_config = &amd_zen2_config;
-                break;
-        }
-    }
-    */
 
-    if (active_config) {
+    /* AMD Zen 2 — placeholder for future support */
+    else if (c->x86_vendor == X86_VENDOR_AMD && c->x86 == 0x17) {
+        /*
+         * TODO: Add amd_zen2_config when ready:
+         * active_config = &amd_zen2_config;
+         *
+         * For now, we’ll use fallback mapping.
+         */
+    }
+
+    /* --------------------------------------------------------------
+     * Fallback path if no known mapping found
+     * -------------------------------------------------------------- */
+    if (!active_config) {
+        static const size_t id_matrix[1] = { 1 };
+        static struct dram_config fallback = {
+            .name = "Unknown-DRAM-Fallback",
+            .dram_matrix = id_matrix,
+            .addr_matrix = id_matrix,
+            .phys_dram_offset = 0,
+            .bank_mask = 0,
+            .bank_shift = 0,
+            .row_mask = 0,
+            .row_shift = 0,
+            .column_mask = 0,
+            .column_shift = 0,
+            .matrix_size = 1,
+        };
+        active_config = &fallback;
         generic_dram_ops.arch_name = active_config->name;
         dram_def = &generic_dram_ops;
-        printk(KERN_INFO "anvil: Detected and registered mapping for %s\n", active_config->name);
+        printk(KERN_WARNING "anvil: No known DRAM mapping; using fallback. Row+/- will be approximate.\n");
         return 0;
-    } else {
-        printk(KERN_WARNING "anvil: No known DRAM mapping for this CPU. Functionality will be limited.\n");
-        return -ENODEV;
     }
+
+    generic_dram_ops.arch_name = active_config->name;
+    dram_def = &generic_dram_ops;
+    printk(KERN_INFO "anvil: Detected and registered mapping for %s\n", active_config->name);
+    return 0;
 }
 
 EXPORT_SYMBOL(detect_and_register_dram_mapping);
