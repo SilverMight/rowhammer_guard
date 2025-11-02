@@ -223,7 +223,9 @@ void action_wq_callback( struct work_struct *work)
 #endif
 
 	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
+#ifdef DEBUG
 		printk("samples = %u\n",sample_total);
+#endif
 		/* calculate hammer threshold */
         hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
 
