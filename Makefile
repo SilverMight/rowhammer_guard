@@ -1,10 +1,9 @@
-obj-m += rowhammer_guard.o 
 
-
-PWD := $(CURDIR) 
+obj-m += anvil.o
+anvil-objs := anvil_main.o dram_mapping.o intel_dram_mapping.o
 
 all:
-	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules 
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
-clean: 
-	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
