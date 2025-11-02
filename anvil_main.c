@@ -18,6 +18,7 @@
 #include <asm/page.h>
 #include <asm/uaccess.h>
 #include <linux/delay.h>
+#include <linux/version.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
