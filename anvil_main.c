@@ -96,7 +96,9 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 	if(ret <= 0)
 		return 0;
 	/* get physical address */
-	phys = page_to_phys(pg);
+    phys = page_to_phys(pg);
+    // Release page, otherwise we will hold the page and never free it
+    put_page(pg);
 	return phys;
 }
 
