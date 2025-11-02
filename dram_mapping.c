@@ -82,7 +82,8 @@ int detect_and_register_dram_mapping(void)
 
         struct cpuinfo_x86 *c = &boot_cpu_data;
 
-    if (c->x86_vendor == X86_VENDOR_INTEL && c->x86 == 6) {
+    // Intel Family 6
+    if (c->x86_vendor == X86_VENDOR_INTEL && c->x86 == 0x6) {
         switch (c->x86_model) {
             case 0x9E: // Coffee Lake
             case 0x97: 
@@ -95,9 +96,8 @@ int detect_and_register_dram_mapping(void)
                 break;
         }
     }
-    // TODO: Add AMD support
-    /* else if (c->x86_vendor == X86_VENDOR_AMD && c->x86 == 0x17) {
-        // Family 0x17 is Zen. Now check model.
+    // Zen Family
+    else if (c->x86_vendor == X86_VENDOR_AMD && c->x86 == 0x17) {
         switch (c->x86_model) {
             case 0x71: // Zen 2 (e.g., Ryzen 5 3600)
             case 0x60: // Zen 2 (e.g., Ryzen 5 5600G)
@@ -105,7 +105,7 @@ int detect_and_register_dram_mapping(void)
                 break;
         }
     }
-    */
+    
 
     if (active_config) {
         generic_dram_ops.arch_name = active_config->name;
