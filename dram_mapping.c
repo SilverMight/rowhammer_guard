@@ -5,6 +5,9 @@
 #include <linux/module.h>
 #include <asm/page_types.h>
 
+bool is_intel = false;
+EXPORT_SYMBOL(is_intel);
+
 struct dram_mapping_ops* dram_def = NULL;
 EXPORT_SYMBOL(dram_def);
 
@@ -84,6 +87,7 @@ int detect_and_register_dram_mapping(void)
 
     // Intel Family 6
     if (c->x86_vendor == X86_VENDOR_INTEL && c->x86 == 0x6) {
+        is_intel = true;
         switch (c->x86_model) {
             case 0x9E: // Coffee Lake
             case 0x97: 
