@@ -1,5 +1,3 @@
-#define DEBUG
-
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/perf_event.h>
@@ -47,6 +45,7 @@ static unsigned long L2_count=0;
 static unsigned long refresh_count=0;
 static unsigned int hammer_threshold;
 unsigned long dummy;
+extern bool is_intel;
 
 /* for logging */
 static struct sample_log log[25000];
@@ -154,6 +153,7 @@ void llc_event_wq_callback(struct work_struct *work)
 			perf_event_disable(per_cpu(ld_lat_event,cpu));
 			perf_event_disable(per_cpu(precise_str_event,cpu));
 		}
+		
 		sampling = 0;			
 		/* start task that anayzes samples and take action */ 
 		queue_work(action_wq, &task);
@@ -307,12 +307,20 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
     	val += perf_event_read_value(per_cpu(llc_event,cpu), &enabled, &running);
 	}
 
+
 	miss_total = val - old_val;
 	old_val = val;
 	if(!sampling){
 	/* Start sampling if miss rate is high */
 		if(miss_total > LLC_MISS_THRESHOLD){
-			start_sampling = 1;
+
+			if(is_intel) {
+				start_sampling = 1;
+			}
+			else {
+				printk(KERN_INFO "anvil: inspection threshold hit (%llu), no action taken\n", miss_total);
+			}
+			
 			/* set next interrupt interval for sampling */
 			ktime = ktime_set(0,sample_timer_period);
       		now = hrtimer_cb_get_time(timer); 
@@ -442,38 +450,41 @@ static int start_init(void)
 		perf_event_enable(per_cpu(llc_event, cpu));
 	}
 
-	old_l1D_val = 0;
-	/* setup LLC Miss event */
-	for_each_online_cpu(cpu){
-   		per_cpu(l1D_event, cpu) = perf_event_create_kernel_counter(&l1D_miss_event, cpu,
-                 NULL,l1D_event_callback,NULL);
-   	 	if(IS_ERR(per_cpu(l1D_event, cpu))){
-        	printk("Error creating l1D miss event.\n");
-        	return 0;
-    	}
-						
-		/* start counting */
-		perf_event_enable(per_cpu(l1D_event, cpu));
-	}
+	/* Intel Specific Events */
+	if(is_intel) {
+		old_l1D_val = 0;
+		/* setup LLC Miss event */
+		for_each_online_cpu(cpu){
+			per_cpu(l1D_event, cpu) = perf_event_create_kernel_counter(&l1D_miss_event, cpu,
+					NULL,l1D_event_callback,NULL);
+			if(IS_ERR(per_cpu(l1D_event, cpu))){
+				printk("Error creating l1D miss event.\n");
+				return 0;
+			}
+							
+			/* start counting */
+			perf_event_enable(per_cpu(l1D_event, cpu));
+		}
 
-	/* setup load latency event */
-	for_each_online_cpu(cpu){
-   		per_cpu(ld_lat_event, cpu) = perf_event_create_kernel_counter(&load_latency_event, cpu,
-                 													NULL,load_latency_callback,NULL);
-   	 	if(IS_ERR(per_cpu(ld_lat_event, cpu))){
-        	printk("Error creating load latency event.\n");
-        	return 0;
-    	}
-	}
-
-	/* setup precise store event */
-	for_each_online_cpu(cpu){
-   		per_cpu(precise_str_event, cpu) = perf_event_create_kernel_counter(&precise_str_event_attr, cpu,
-                 															NULL,precise_str_callback,NULL);
-   	 	if(IS_ERR(per_cpu(precise_str_event, cpu))){
-        	printk("Error creating precise store event.\n");
-        	return 0;
-    	}
+		/* setup load latency event */
+		for_each_online_cpu(cpu){
+			per_cpu(ld_lat_event, cpu) = perf_event_create_kernel_counter(&load_latency_event, cpu,
+																		NULL,load_latency_callback,NULL);
+			if(IS_ERR(per_cpu(ld_lat_event, cpu))){
+				printk("Error creating load latency event.\n");
+				return 0;
+			}
+		}
+		
+		/* setup precise store event */
+		for_each_online_cpu(cpu){
+			per_cpu(precise_str_event, cpu) = perf_event_create_kernel_counter(&precise_str_event_attr, cpu,
+																				NULL,precise_str_callback,NULL);
+			if(IS_ERR(per_cpu(precise_str_event, cpu))){
+				printk("Error creating precise store event.\n");
+				return 0;
+			}
+		}
 	}
 
 	/* setup Timer */
@@ -488,8 +499,8 @@ static int start_init(void)
 
 	llc_event_wq = create_workqueue("llc_event_queue");
 	INIT_WORK(&task2, llc_event_wq_callback);
-
-	printk("done initializing\n");
+	
+	printk(KERN_INFO "anvil: kernel module initialized\n");
   	
    	return 0;
 }
@@ -499,7 +510,7 @@ static void finish_exit(void)
 {
     int ret,cpu,i,j; 
     /* timer */
-    ret = hrtimer_cancel(&sample_timer);
+	ret = hrtimer_cancel(&sample_timer);
 
     /* llc_event */
 	for_each_online_cpu(cpu){
@@ -509,35 +520,37 @@ static void finish_exit(void)
     	}
 	}
 
-	/* l1D_event */
-	for_each_online_cpu(cpu){
-    	if(per_cpu(l1D_event, cpu)){
-    		perf_event_disable(per_cpu(l1D_event, cpu));
-        	perf_event_release_kernel(per_cpu(l1D_event, cpu));
-    	}
-	}
+	if(is_intel) {
+		/* l1D_event */
+		for_each_online_cpu(cpu){
+			if(per_cpu(l1D_event, cpu)){
+				perf_event_disable(per_cpu(l1D_event, cpu));
+				perf_event_release_kernel(per_cpu(l1D_event, cpu));
+			}
+		}
 
-	/* load latency event */
-	for_each_online_cpu(cpu){
-    	if(per_cpu(ld_lat_event, cpu)){
-        	perf_event_disable(per_cpu(ld_lat_event, cpu));
-        	perf_event_release_kernel(per_cpu(ld_lat_event, cpu));
-    	}
-	}
+		/* load latency event */
+		for_each_online_cpu(cpu){
+			if(per_cpu(ld_lat_event, cpu)){
+				perf_event_disable(per_cpu(ld_lat_event, cpu));
+				perf_event_release_kernel(per_cpu(ld_lat_event, cpu));
+			}
+		}
 
-	/* precise store event */
-	for_each_online_cpu(cpu){
-    	if(per_cpu(precise_str_event, cpu)){
-    		perf_event_disable(per_cpu(precise_str_event, cpu));
-        	perf_event_release_kernel(per_cpu(precise_str_event, cpu));
-   		 }
+		/* precise store event */
+		for_each_online_cpu(cpu){
+			if(per_cpu(precise_str_event, cpu)){
+				perf_event_disable(per_cpu(precise_str_event, cpu));
+				perf_event_release_kernel(per_cpu(precise_str_event, cpu));
+			}
+		}
 	}
-
+	
 	flush_workqueue(action_wq);
   	destroy_workqueue(action_wq);
 	flush_workqueue(llc_event_wq);
   	destroy_workqueue(llc_event_wq);
-
+	
 #ifdef DEBUG
 	/* Log of ANVIL. CSV of some of the sampled/detected addresses */
 			 
@@ -569,6 +582,8 @@ static void finish_exit(void)
 	printk(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
     return;
 #endif
+
+	printk(KERN_INFO "anvil: module removed\n");
 }
 
 module_init(start_init);
