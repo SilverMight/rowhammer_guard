@@ -19,6 +19,9 @@
 #include <asm/uaccess.h>
 #include <linux/delay.h>
 #include <linux/sort.h>
+#include <linux/kfifo.h>
+#include <linux/atomic.h>
+#include <linux/spinlock.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -32,10 +35,12 @@ static struct hrtimer sample_timer;
 static ktime_t ktime;
 static u64 old_val,val;
 static u64 old_l1D_val,l1D_val,miss_total;
-static sample_t sample_buffer[SAMPLES_MAX];
-static int sampling;
-static int start_sampling=0;
-static int sample_head;
+
+#define FIFO_SIZE (SAMPLES_MAX * sizeof(sample_t))
+DEFINE_PER_CPU(struct kfifo, sample_buffer);
+
+static atomic_t sampling;
+static atomic_t start_sampling;
 static unsigned int sample_total;
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
@@ -50,12 +55,15 @@ unsigned long dummy;
 
 /* for logging */
 static struct sample_log log[25000];
-static int log_index=0;
+static atomic_t log_index;
 
 static struct workqueue_struct *action_wq;
 static struct workqueue_struct *llc_event_wq;
 static struct work_struct task;
 static struct work_struct task2;
+
+static DEFINE_SPINLOCK(profile_lock);
+
 
 static void build_profile(void);
 static int profile_compare(const void *a, const void *b);
@@ -108,16 +116,13 @@ void precise_str_callback(struct perf_event *event,
             				struct perf_sample_data *data,
             				struct pt_regs *regs)
 {
+	sample_t sample;
 	/* Check source of store, if local dram (|0x80) record sample */
 	if(data->data_src.val & (1<<7)){
-	
-		sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
-		if(sample_buffer[sample_head].phy_page > 0){
-			sample_buffer[sample_head].addr = data->addr;
-			/* limit sample index */
-			if(++sample_head > SAMPLES_MAX-1)
-				sample_head = SAMPLES_MAX-1;
-
+		sample.phy_page = virt_to_phy(current->mm,data->addr)>>PAGE_SHIFT;
+		if(sample.phy_page > 0){
+			sample.addr = data->addr;
+			kfifo_in(this_cpu_ptr(&sample_buffer), &sample, sizeof(sample_t));
 			sample_total++;
 		}
 	}
@@ -128,17 +133,14 @@ void load_latency_callback(struct perf_event *event,
             struct perf_sample_data *data,
             struct pt_regs *regs)
 {	
-	sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
+	sample_t sample;
+	sample.phy_page = virt_to_phy(current->mm,data->addr)>>PAGE_SHIFT;
 
 #ifdef DEBUG
-	sample_buffer[sample_head].addr = data->addr;
-	sample_buffer[sample_head].lat = data->weight.full;
+	sample.addr = data->addr;
+	sample.lat = data->weight.full;
 #endif
-
-	/* limit sample index */
-	if(++sample_head > SAMPLES_MAX-1)
-		sample_head = SAMPLES_MAX-1;
-	
+	kfifo_in(this_cpu_ptr(&sample_buffer), &sample, sizeof(sample_t));
 	sample_total++;
 }
 
@@ -149,17 +151,17 @@ void llc_event_wq_callback(struct work_struct *work)
 	u64 ld_miss;
 
 	/* If we were sampling, stop sampling and analyze samples */
-	if(sampling){
+	if(atomic_read(&sampling)){
 		/* stop sampling */
 		for_each_online_cpu(cpu){
 			perf_event_disable(per_cpu(ld_lat_event,cpu));
 			perf_event_disable(per_cpu(precise_str_event,cpu));
 		}
-		sampling = 0;			
+		atomic_set(&sampling, 0);			
 		/* start task that anayzes samples and take action */ 
 		queue_work(action_wq, &task);
 	}							
-	else if(start_sampling){
+	else if(atomic_read(&start_sampling)){
 		/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
 		l1D_val = 0;
 		for_each_online_cpu(cpu){
@@ -192,12 +194,11 @@ void llc_event_wq_callback(struct work_struct *work)
 							
 		sample_total = 0;
 		record_size = 0;
-		sample_head = 0;
 			
 		/* log how many times we passed the threshold */
 		L1_count++;
-		start_sampling = 0;
-		sampling = 1;
+		atomic_set(&start_sampling, 0);
+		atomic_set(&sampling, 1);
 	}
 
 	old_l1D_val = l1D_val;
@@ -215,6 +216,8 @@ void action_wq_callback( struct work_struct *work)
 		
 	/* group samples based on physical pages */
 	build_profile();
+
+	spin_lock(&profile_lock);
 	/* sort profile, address with highest number
 	of samples first */
     sort(profile,record_size,sizeof(profile_t),profile_compare,NULL);
@@ -280,20 +283,21 @@ void action_wq_callback( struct work_struct *work)
 
 #ifdef DEBUG
 	if(log_){
-		for(rec = 0;rec<record_size;rec++){
-			log[log_index].profile[rec].phy_page = profile[rec].phy_page;
-			log[log_index].profile[rec].llc_percent_miss = profile[rec].llc_percent_miss;
-			log[log_index].profile[rec].dummy1 = profile[rec].dummy1;
-			log[log_index].profile[rec].dummy2 = profile[rec].dummy2;
-			log[log_index].profile[rec].hammer = profile[rec].hammer;
+		int current_log_index = atomic_inc_return(&log_index) - 1;
+		if(current_log_index < 25000){
+			for(rec = 0;rec<record_size;rec++){
+				log[current_log_index].profile[rec].phy_page = profile[rec].phy_page;
+				log[current_log_index].profile[rec].llc_percent_miss = profile[rec].llc_percent_miss;
+				log[current_log_index].profile[rec].dummy1 = profile[rec].dummy1;
+				log[current_log_index].profile[rec].dummy2 = profile[rec].dummy2;
+				log[current_log_index].profile[rec].hammer = profile[rec].hammer;
+			}
+			log[current_log_index].record_size = record_size;
+			log[current_log_index].sample_total = sample_total;
 		}
-		log[log_index].record_size = record_size;
-		log[log_index].sample_total = sample_total;
-		log_index++;
-		if(log_index > 24999)
-			log_index = 24999;
 	}
 #endif
+	spin_unlock(&profile_lock);
 	return;
 }
 
@@ -312,10 +316,10 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 
 	miss_total = val - old_val;
 	old_val = val;
-	if(!sampling){
+	if(!atomic_read(&sampling)){
 	/* Start sampling if miss rate is high */
 		if(miss_total > LLC_MISS_THRESHOLD){
-			start_sampling = 1;
+			atomic_set(&start_sampling, 1);
 			/* set next interrupt interval for sampling */
 			ktime = ktime_set(0,sample_timer_period);
       		now = hrtimer_cb_get_time(timer); 
@@ -346,50 +350,45 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 /* Groups samples accoriding to accessed physical pages */
 static void build_profile(void)
 {
-	int rec,smpl,recorded;
+	int rec,recorded,cpu;
 	sample_t sample;
 
 	if(sample_total > 0){
-		sample = sample_buffer[0];
-		profile[0].phy_page 	= sample.phy_page;
-		profile[0].page = (sample.addr);
-		profile[0].llc_total_miss = 1;
-		profile[0].llc_percent_miss = 100;
-		profile[0].cpu 	= sample.cpu;
-		record_size = 1;
-			
-		for(smpl=1; smpl<sample_head; smpl++){
-			sample = sample_buffer[smpl];
-
-			/* see if page already exists */
-			recorded = 0;
-			for(rec=0;rec<record_size;rec++){
-				if((profile[rec].phy_page != 0) && 
-					(profile[rec].phy_page == sample.phy_page)){
-					profile[rec].llc_total_miss++;
-					profile[rec].cpu 	= sample.cpu;
-					recorded = 1;
-					break;
-				}
-			}
-
-			if(!recorded){
-				/* must be new record */
-				/* If there is space in the profile add new record
-				else replace the last one  (The least miss in the profile) */
-				if(record_size < PROFILE_N){
-					profile[record_size].phy_page 	= sample.phy_page;
-					profile[record_size].page = (sample.addr);
-					profile[record_size].llc_total_miss = 1;
-					profile[record_size].cpu = sample.cpu;
-					record_size++;
+		spin_lock(&profile_lock);
+		record_size = 0;
+		for_each_online_cpu(cpu){
+			struct kfifo *fifo = &per_cpu(sample_buffer, cpu);
+			while(kfifo_out(fifo, &sample, sizeof(sample_t))){
+				/* see if page already exists */
+				recorded = 0;
+				for(rec=0;rec<record_size;rec++){
+					if((profile[rec].phy_page != 0) && 
+						(profile[rec].phy_page == sample.phy_page)){
+						profile[rec].llc_total_miss++;
+						profile[rec].cpu 	= sample.cpu;
+						recorded = 1;
+						break;
+					}
 				}
 
-				else{
-					profile[record_size - 1].phy_page = sample.phy_page;
-					profile[record_size - 1].page = (sample.addr);
-					profile[record_size - 1].llc_total_miss = 1;
-					profile[record_size - 1].cpu = sample.cpu;
+				if(!recorded){
+					/* must be new record */
+					/* If there is space in the profile add new record
+					else replace the last one  (The least miss in the profile) */
+					if(record_size < PROFILE_N){
+						profile[record_size].phy_page 	= sample.phy_page;
+						profile[record_size].page = (sample.addr);
+						profile[record_size].llc_total_miss = 1;
+						profile[record_size].cpu = sample.cpu;
+						record_size++;
+					}
+
+					else{
+						profile[record_size - 1].phy_page = sample.phy_page;
+						profile[record_size - 1].page = (sample.addr);
+						profile[record_size - 1].llc_total_miss = 1;
+						profile[record_size - 1].cpu = sample.cpu;
+					}
 				}
 			}
 		}
@@ -400,6 +399,7 @@ static void build_profile(void)
 			profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
 		}
 #endif
+		spin_unlock(&profile_lock);
 	}
 }
 
@@ -423,6 +423,18 @@ static int start_init(void)
             printk(KERN_ERR "Error detecting DRAM mapping\n");
             return ret;
     }
+
+	for_each_online_cpu(cpu){
+		ret = kfifo_alloc(&per_cpu(sample_buffer, cpu), FIFO_SIZE, GFP_KERNEL);
+		if(ret){
+			printk(KERN_ERR "Error allocating kfifo\n");
+			return ret;
+		}
+	}
+
+	atomic_set(&sampling, 0);
+	atomic_set(&start_sampling, 0);
+	atomic_set(&log_index, 0);
 
 	old_val = 0;
 	/* Setup LLC Miss event */
@@ -492,7 +504,8 @@ static int start_init(void)
 /* Cleanup module */
 static void finish_exit(void)
 {
-    int ret,cpu,i,j; 
+    int ret,cpu,i,j;
+    int current_log_index;
     /* timer */
     ret = hrtimer_cancel(&sample_timer);
 
@@ -528,6 +541,10 @@ static void finish_exit(void)
    		 }
 	}
 
+	for_each_online_cpu(cpu){
+		kfifo_free(&per_cpu(sample_buffer, cpu));
+	}
+
 	flush_workqueue(action_wq);
   	destroy_workqueue(action_wq);
 	flush_workqueue(llc_event_wq);
@@ -538,7 +555,8 @@ static void finish_exit(void)
 			 
 	printk(">>>>>>>>>>>>>>>>log dump>>>>>>>>>>>>>>>\n");
 	/* dump all the logs */
-	for(i=0; i<log_index; i++)
+	current_log_index = atomic_read(&log_index);
+	for(i=0; i<current_log_index; i++)
 	{
 		for(j=0; j<4; j++){
 			/* physical pages */
