@@ -409,7 +409,8 @@ static int profile_compare(const void *a, const void *b)
     profile_t *prof_a = (profile_t *)a;
     profile_t *prof_b = (profile_t *)b;
 
-    return prof_b->llc_percent_miss - prof_a->llc_percent_miss;
+    // NOTE: sorting by total LLC misses
+    return prof_b->llc_total_miss - prof_a->llc_total_miss;
 }
 
 /* Initialize module */
