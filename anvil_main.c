@@ -16,6 +16,7 @@
 #include <asm/page.h>
 #include <asm/uaccess.h>
 #include <linux/delay.h>
+#include <linux/sort.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -54,8 +55,8 @@ static struct workqueue_struct *llc_event_wq;
 static struct work_struct task;
 static struct work_struct task2;
 
-static void sort(void);
 static void build_profile(void);
+static int profile_compare(const void *a, const void *b);
 DEFINE_PER_CPU(struct perf_event *, llc_event);
 DEFINE_PER_CPU(struct perf_event *, l1D_event);
 DEFINE_PER_CPU(struct perf_event *, ld_lat_event);
@@ -214,7 +215,7 @@ void action_wq_callback( struct work_struct *work)
 	build_profile();
 	/* sort profile, address with highest number
 	of samples first */
-	sort();
+    sort(profile,record_size,sizeof(profile_t),profile_compare,NULL);
 
 #ifdef DEBUG
 	log_=0;
@@ -401,21 +402,13 @@ static void build_profile(void)
 }
 
 /* Sort addresses with higest address distribution first */
-static void sort(void){
-	int swapped,rec;
-	do{
-		swapped = 0;
-		for(rec = 1; rec<record_size; rec++){
-			if(profile[rec-1].llc_percent_miss < profile[rec].llc_percent_miss){
-				profile_t temp = profile[rec-1];
-				profile[rec-1] = profile[rec];
-				profile[rec] = temp;
-				swapped = 1;
-			}
-		}
-	}while(swapped);
-}
+static int profile_compare(const void *a, const void *b)
+{
+    profile_t *prof_a = (profile_t *)a;
+    profile_t *prof_b = (profile_t *)b;
 
+    return prof_b->llc_percent_miss - prof_a->llc_percent_miss;
+}
 
 /* Initialize module */
 static int start_init(void)
