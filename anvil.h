@@ -1,5 +1,6 @@
 
 #include <linux/perf_event.h>
+#include <linux/kfifo.h>
 
 
 #define LOAD_LATENCY_EVENT 0x01CD

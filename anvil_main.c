@@ -17,6 +17,7 @@
 #include <asm/uaccess.h>
 #include <linux/delay.h>
 #include <linux/sort.h>
+#include <linux/log2.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -30,13 +31,12 @@ static struct hrtimer sample_timer;
 static ktime_t ktime;
 static u64 old_val,val;
 static u64 old_l1D_val,l1D_val,miss_total;
-static sample_t sample_buffer[SAMPLES_MAX];
 static int sampling;
 static int start_sampling=0;
-static int sample_head;
-static unsigned int sample_total;
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
+static DEFINE_SPINLOCK(samples_lock);
+static DECLARE_KFIFO(samples, sample_t, roundup_pow_of_two(SAMPLES_MAX));
 /* counts number of times L1 threhold was
 passed (sampling was done) */
 static unsigned long L1_count=0;
@@ -55,7 +55,7 @@ static struct workqueue_struct *llc_event_wq;
 static struct work_struct task;
 static struct work_struct task2;
 
-static void build_profile(void);
+static void build_profile(size_t sample_total);
 static int profile_compare(const void *a, const void *b);
 DEFINE_PER_CPU(struct perf_event *, llc_event);
 DEFINE_PER_CPU(struct perf_event *, l1D_event);
@@ -106,17 +106,17 @@ void precise_str_callback(struct perf_event *event,
             				struct perf_sample_data *data,
             				struct pt_regs *regs)
 {
+	sample_t sample;
+	unsigned long flags;
 	/* Check source of store, if local dram (|0x80) record sample */
 	if(data->data_src.val & (1<<7)){
 	
-		sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
-		if(sample_buffer[sample_head].phy_page > 0){
-			sample_buffer[sample_head].addr = data->addr;
-			/* limit sample index */
-			if(++sample_head > SAMPLES_MAX-1)
-				sample_head = SAMPLES_MAX-1;
-
-			sample_total++;
+		sample.phy_page = virt_to_phy(current->mm,data->addr)>>12;
+		if(sample.phy_page > 0){
+			sample.addr = data->addr;
+			spin_lock_irqsave(&samples_lock, flags);
+			kfifo_put(&samples, sample);
+			spin_unlock_irqrestore(&samples_lock, flags);
 		}
 	}
 }
@@ -126,18 +126,17 @@ void load_latency_callback(struct perf_event *event,
             struct perf_sample_data *data,
             struct pt_regs *regs)
 {	
-	sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
+	sample_t sample;
+	unsigned long flags;
+	sample.phy_page = virt_to_phy(current->mm,data->addr)>>12;
 
 #ifdef DEBUG
-	sample_buffer[sample_head].addr = data->addr;
-	sample_buffer[sample_head].lat = data->weight.full;
+	sample.addr = data->addr;
+	sample.lat = data->weight.full;
 #endif
-
-	/* limit sample index */
-	if(++sample_head > SAMPLES_MAX-1)
-		sample_head = SAMPLES_MAX-1;
-	
-	sample_total++;
+	spin_lock_irqsave(&samples_lock, flags);
+	kfifo_put(&samples, sample);
+	spin_unlock_irqrestore(&samples_lock, flags);
 }
 
 void llc_event_wq_callback(struct work_struct *work)
@@ -188,9 +187,8 @@ void llc_event_wq_callback(struct work_struct *work)
 			}			
 		}
 							
-		sample_total = 0;
+		kfifo_reset(&samples);
 		record_size = 0;
-		sample_head = 0;
 			
 		/* log how many times we passed the threshold */
 		L1_count++;
@@ -207,12 +205,20 @@ void action_wq_callback( struct work_struct *work)
 	int rec,log_;
 	unsigned long pfn1,pfn2;
 	unsigned long *virt;
+    size_t sample_total;
 
 	struct page *pg1,*pg2;
 	int i;
 		
+    /* NOTE: Any operations here do NOT need to lock samples_lock:
+     * This workqueue is only queued after sampling is stopped,
+     * so no other code is adding to the samples kfifo at this time. */
+
+	/* Get number of samples before consuming them */
+	sample_total = kfifo_len(&samples);
+
 	/* group samples based on physical pages */
-	build_profile();
+	build_profile(sample_total);
 	/* sort profile, address with highest number
 	of samples first */
     sort(profile,record_size,sizeof(profile_t),profile_compare,NULL);
@@ -220,12 +226,11 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
 	log_=0;
 #endif
-
 	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
 #ifdef DEBUG
-		printk("samples = %u\n",sample_total);
+		printk("samples = %llu\n",sample_total);
 #endif
-		/* calculate hammer threshold */
+	/* calculate hammer threshold */
         hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
 
         /* check for potential agressors */
@@ -233,11 +238,13 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
             profile[rec].hammer = 0;
 #endif
-            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total>= MIN_SAMPLES)){
+            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total >= MIN_SAMPLES)){
 #ifdef DEBUG
                 log_ = 1;
                 profile[rec].hammer = 1;
                 L2_count++;
+                printk("anvil: Potential hammering detected on page %lu with %u misses\n",
+                        profile[rec].phy_page,profile[rec].llc_total_miss);
 #endif
                 /* potential hammering detected , deploy refresh */
                 for(i=1;i<=REFRESHED_ROWS;i++){
@@ -342,13 +349,12 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 }
 
 /* Groups samples accoriding to accessed physical pages */
-static void build_profile(void)
+static void build_profile(size_t sample_total)
 {
-	int rec,smpl,recorded;
+	int rec, recorded;
 	sample_t sample;
 
-	if(sample_total > 0){
-		sample = sample_buffer[0];
+    if (kfifo_get(&samples, &sample)) {
 		profile[0].phy_page 	= sample.phy_page;
 		profile[0].page = (sample.addr);
 		profile[0].llc_total_miss = 1;
@@ -356,9 +362,7 @@ static void build_profile(void)
 		profile[0].cpu 	= sample.cpu;
 		record_size = 1;
 			
-		for(smpl=1; smpl<sample_head; smpl++){
-			sample = sample_buffer[smpl];
-
+		while(kfifo_get(&samples, &sample)){
 			/* see if page already exists */
 			recorded = 0;
 			for(rec=0;rec<record_size;rec++){
@@ -394,8 +398,10 @@ static void build_profile(void)
 
 #ifdef DEBUG
 		/* calculate percentage */
-		for(rec=0;rec<record_size;rec++){
-			profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
+		if (sample_total > 0) {
+			for(rec=0;rec<record_size;rec++){
+				profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
+			}
 		}
 #endif
 	}
@@ -416,6 +422,8 @@ static int start_init(void)
 {
 	int cpu;
     int ret;
+
+    INIT_KFIFO(samples);
 
     ret = detect_and_register_dram_mapping();
     if(ret){
