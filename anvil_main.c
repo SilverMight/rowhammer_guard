@@ -31,8 +31,15 @@ static struct hrtimer sample_timer;
 static ktime_t ktime;
 static u64 old_val,val;
 static u64 old_l1D_val,l1D_val,miss_total;
-static int sampling;
-static int start_sampling=0;
+
+enum sampling_state {
+	STATE_IDLE,
+	STATE_ARMED,
+	STATE_SAMPLING,
+};
+
+static enum sampling_state current_state = STATE_IDLE;
+
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
 static DEFINE_SPINLOCK(samples_lock);
@@ -146,54 +153,61 @@ void llc_event_wq_callback(struct work_struct *work)
 	u64 ld_miss;
 
 	/* If we were sampling, stop sampling and analyze samples */
-	if(sampling){
-		/* stop sampling */
-		for_each_online_cpu(cpu){
-			perf_event_disable(per_cpu(ld_lat_event,cpu));
-			perf_event_disable(per_cpu(precise_str_event,cpu));
-		}
-		sampling = 0;			
-		/* start task that anayzes samples and take action */ 
-		queue_work(action_wq, &task);
-	}							
-	else if(start_sampling){
-		/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
-		l1D_val = 0;
-		for_each_online_cpu(cpu){
-        	l1D_val += perf_event_read_value(per_cpu(l1D_event,cpu), 
-											&enabled, &running);
-		}
-							
-		ld_miss = l1D_val - old_l1D_val;
-						
-		/* Sample loads, stores or both based on LLC load miss count */
-		if(ld_miss >= (miss_total*9)/10){
-			for_each_online_cpu(cpu){
-				perf_event_enable(per_cpu(ld_lat_event,cpu));//sample loads only
+	switch(current_state){
+		case STATE_SAMPLING:
+			{
+				/* stop sampling */
+				for_each_online_cpu(cpu){
+					perf_event_disable(per_cpu(ld_lat_event,cpu));
+					perf_event_disable(per_cpu(precise_str_event,cpu));
+				}
+				current_state = STATE_IDLE;
+				/* start task that anayzes samples and take action */ 
+				queue_work(action_wq, &task);
+				break;
 			}
-		}
-
-		else if(ld_miss < miss_total/10){
+		case STATE_ARMED: {
+			/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
+			l1D_val = 0;
 			for_each_online_cpu(cpu){
-				perf_event_enable(per_cpu(precise_str_event,cpu));//sample stores only
+				l1D_val += perf_event_read_value(per_cpu(l1D_event,cpu), 
+									 &enabled, &running);
 			}
-		}
 
-		else{
-			for_each_online_cpu(cpu){
-				/* sample both */
-				perf_event_enable(per_cpu(ld_lat_event,cpu));
-				perf_event_enable(per_cpu(precise_str_event,cpu));
-			}			
+			ld_miss = l1D_val - old_l1D_val;
+
+			/* Sample loads, stores or both based on LLC load miss count */
+			if(ld_miss >= (miss_total*9)/10){
+				for_each_online_cpu(cpu){
+					perf_event_enable(per_cpu(ld_lat_event,cpu));//sample loads only
+				}
+			}
+
+			else if(ld_miss < miss_total/10){
+				for_each_online_cpu(cpu){
+					perf_event_enable(per_cpu(precise_str_event,cpu));//sample stores only
+				}
+			}
+
+			else{
+				for_each_online_cpu(cpu){
+					/* sample both */
+					perf_event_enable(per_cpu(ld_lat_event,cpu));
+					perf_event_enable(per_cpu(precise_str_event,cpu));
+				}			
+			}
+
+			kfifo_reset(&samples);
+			record_size = 0;
+
+			/* log how many times we passed the threshold */
+			L1_count++;
+			current_state = STATE_SAMPLING;
+			break;
 		}
-							
-		kfifo_reset(&samples);
-		record_size = 0;
-			
-		/* log how many times we passed the threshold */
-		L1_count++;
-		start_sampling = 0;
-		sampling = 1;
+		case STATE_IDLE:
+		default:
+			break;
 	}
 
 	old_l1D_val = l1D_val;
@@ -317,10 +331,10 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 
 	miss_total = val - old_val;
 	old_val = val;
-	if(!sampling){
+	if(current_state == STATE_IDLE){
 	/* Start sampling if miss rate is high */
 		if(miss_total > LLC_MISS_THRESHOLD){
-			start_sampling = 1;
+			current_state = STATE_ARMED;
 			/* set next interrupt interval for sampling */
 			ktime = ktime_set(0,sample_timer_period);
       		now = hrtimer_cb_get_time(timer); 
