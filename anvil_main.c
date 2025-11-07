@@ -248,7 +248,7 @@ void action_wq_callback( struct work_struct *work)
 #endif
 	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
 #ifdef DEBUG
-		printk("samples = %llu\n",sample_total);
+		printk("samples = %lu\n",sample_total);
 #endif
 	/* calculate hammer threshold */
         hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
@@ -263,7 +263,7 @@ void action_wq_callback( struct work_struct *work)
                 log_ = 1;
                 profile[rec].hammer = 1;
                 L2_count++;
-                printk("anvil: Potential hammering detected on page %lu with %u misses\n",
+                printk("anvil: Potential hammering detected on page %lu with %lu misses\n",
                         profile[rec].phy_page,profile[rec].llc_total_miss);
 #endif
                 /* potential hammering detected , deploy refresh */
