@@ -177,6 +177,10 @@ void llc_event_wq_callback(struct work_struct *work)
 
 			ld_miss = l1D_val - old_l1D_val;
 
+			// reset samples BEFORE enabling events
+			kfifo_reset(&samples);
+			record_size = 0;
+
 			/* Sample loads, stores or both based on LLC load miss count */
 			if(ld_miss >= (miss_total*9)/10){
 				for_each_online_cpu(cpu){
@@ -198,8 +202,6 @@ void llc_event_wq_callback(struct work_struct *work)
 				}			
 			}
 
-			kfifo_reset(&samples);
-			record_size = 0;
 
 			/* log how many times we passed the threshold */
 			L1_count++;
