@@ -39,6 +39,7 @@ enum sampling_state {
 };
 
 static enum sampling_state current_state = STATE_IDLE;
+static DEFINE_SPINLOCK(sampling_lock);
 
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
@@ -151,21 +152,21 @@ void llc_event_wq_callback(struct work_struct *work)
 	int cpu;
 	u64 enabled,running;
 	u64 ld_miss;
+	unsigned long flags;
+	bool should_queue_work = false;
 
-	/* If we were sampling, stop sampling and analyze samples */
-	switch(current_state){
-		case STATE_SAMPLING:
-			{
-				/* stop sampling */
-				for_each_online_cpu(cpu){
-					perf_event_disable(per_cpu(ld_lat_event,cpu));
-					perf_event_disable(per_cpu(precise_str_event,cpu));
-				}
-				current_state = STATE_IDLE;
-				/* start task that anayzes samples and take action */ 
-				queue_work(action_wq, &task);
-				break;
+	spin_lock_irqsave(&sampling_lock, flags);
+	switch (current_state) {
+		case STATE_SAMPLING: {
+			/* stop sampling */
+			for_each_online_cpu(cpu){
+				perf_event_disable(per_cpu(ld_lat_event,cpu));
+				perf_event_disable(per_cpu(precise_str_event,cpu));
 			}
+			current_state = STATE_IDLE;
+			should_queue_work = true;
+			break;
+		}
 		case STATE_ARMED: {
 			/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
 			l1D_val = 0;
@@ -205,10 +206,13 @@ void llc_event_wq_callback(struct work_struct *work)
 			current_state = STATE_SAMPLING;
 			break;
 		}
-		case STATE_IDLE:
 		default:
 			break;
 	}
+	spin_unlock_irqrestore(&sampling_lock, flags);
+
+	if (should_queue_work)
+		queue_work(action_wq, &task);
 
 	old_l1D_val = l1D_val;
 }
@@ -322,6 +326,7 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 	ktime_t now;
 	u64 enabled,running;
 	int cpu;
+	unsigned long flags;
         
     /* Update llc miss counter value */
 	val = 0;
@@ -331,6 +336,8 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 
 	miss_total = val - old_val;
 	old_val = val;
+
+	spin_lock_irqsave(&sampling_lock, flags);
 	if(current_state == STATE_IDLE){
 	/* Start sampling if miss rate is high */
 		if(miss_total > LLC_MISS_THRESHOLD){
@@ -354,6 +361,7 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
      	now = hrtimer_cb_get_time(timer); 
       	hrtimer_forward(&sample_timer,now,ktime);
 	}
+	spin_unlock_irqrestore(&sampling_lock, flags);
 				
 	/* start task that analyzes llc misses */
 	queue_work(llc_event_wq, &task2);
