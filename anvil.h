@@ -1,5 +1,7 @@
 
 #include <linux/perf_event.h>
+#include <linux/kfifo.h>
+#include "linux/mm_types.h"
 
 
 #define LOAD_LATENCY_EVENT 0x01CD
@@ -85,6 +87,7 @@ static struct perf_event_attr precise_str_event_attr = {
 /* Address profile */
 typedef struct{
 	unsigned long phy_page;
+	struct mm_struct *mm;
 	unsigned long page;
 	int ld_st;
 	unsigned long llc_total_miss;
@@ -98,12 +101,9 @@ int hammer;
 /* Address sample */
 typedef struct{
 	unsigned long phy_page;
-	u64 addr;
-	u64 lat;
-	u64 time;
-	unsigned int src;
-	int ld_st;//sample is load or store
-	int cpu;
+	struct mm_struct *mm;
+	u64 virt_addr;
+	u32 cpu;
 }sample_t;
 
 /* for logging */

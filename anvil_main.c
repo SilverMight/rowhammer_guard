@@ -17,6 +17,10 @@
 #include <asm/uaccess.h>
 #include <linux/delay.h>
 #include <linux/sort.h>
+#include <linux/log2.h>
+#include <linux/mm_types.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -30,13 +34,20 @@ static struct hrtimer sample_timer;
 static ktime_t ktime;
 static u64 old_val,val;
 static u64 old_l1D_val,l1D_val,miss_total;
-static sample_t sample_buffer[SAMPLES_MAX];
-static int sampling;
-static int start_sampling=0;
-static int sample_head;
-static unsigned int sample_total;
+
+enum sampling_state {
+	STATE_IDLE,
+	STATE_ARMED,
+	STATE_SAMPLING,
+};
+
+static enum sampling_state current_state = STATE_IDLE;
+static DEFINE_SPINLOCK(sampling_lock);
+
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
+static DEFINE_SPINLOCK(samples_lock);
+static DECLARE_KFIFO(samples, sample_t, roundup_pow_of_two(SAMPLES_MAX));
 /* counts number of times L1 threhold was
 passed (sampling was done) */
 static unsigned long L1_count=0;
@@ -55,7 +66,7 @@ static struct workqueue_struct *llc_event_wq;
 static struct work_struct task;
 static struct work_struct task2;
 
-static void build_profile(void);
+static void build_profile(size_t sample_total);
 static int profile_compare(const void *a, const void *b);
 DEFINE_PER_CPU(struct perf_event *, llc_event);
 DEFINE_PER_CPU(struct perf_event *, l1D_event);
@@ -84,21 +95,66 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 {
 	unsigned long phys;
 	struct page *pg;
-	int ret = get_user_pages (
+	int ret;
+
+	mmap_read_lock(mm);
+
+	ret = get_user_pages_remote (
+		mm,
 		virt,
 		1,
-		0,
-		&pg
-        ,NULL
+		FOLL_GET,
+		&pg,
+        NULL,
+		NULL
     );
 
-	if(ret <= 0)
+	mmap_read_unlock(mm);
+
+	if(ret <= 0) {
+		pr_warn(KERN_WARNING "anvil: get_user_pages_remote failed for va: 0x%lx\n", virt);
 		return 0;
+	}
+
 	/* get physical address */
     phys = page_to_phys(pg);
     // Release page, otherwise we will hold the page and never free it
     put_page(pg);
+
 	return phys;
+}
+
+static unsigned long sample_to_pfn(sample_t* sample)
+{
+	unsigned long pfn;
+
+	/* Translate if needed */
+	if (sample->phy_page == 0 && sample->mm) {
+		pfn = virt_to_phy(sample->mm, sample->virt_addr) >> PAGE_SHIFT;
+		mmput(sample->mm); /* Release mm reference */
+	} else {
+		pfn = sample->phy_page >> PAGE_SHIFT;
+	}
+
+	return pfn;
+}
+
+static void store_sample(struct mm_struct* mm,
+						 unsigned long virt_addr)
+{
+	sample_t sample;
+	unsigned long flags;
+
+	if (mm && mmget_not_zero(mm)) {
+		sample.virt_addr = virt_addr;
+		sample.phy_page = 0; // Mark for translation
+		sample.mm = mm;
+		sample.cpu = raw_smp_processor_id();
+
+		spin_lock_irqsave(&samples_lock, flags);
+		kfifo_put(&samples, sample);
+		spin_unlock_irqrestore(&samples_lock, flags);
+	}
 }
 
 /* Interrupt handler for store sample */
@@ -108,16 +164,7 @@ void precise_str_callback(struct perf_event *event,
 {
 	/* Check source of store, if local dram (|0x80) record sample */
 	if(data->data_src.val & (1<<7)){
-	
-		sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
-		if(sample_buffer[sample_head].phy_page > 0){
-			sample_buffer[sample_head].addr = data->addr;
-			/* limit sample index */
-			if(++sample_head > SAMPLES_MAX-1)
-				sample_head = SAMPLES_MAX-1;
-
-			sample_total++;
-		}
+		store_sample(current->mm, data->addr);
 	}
 }
 
@@ -126,18 +173,7 @@ void load_latency_callback(struct perf_event *event,
             struct perf_sample_data *data,
             struct pt_regs *regs)
 {	
-	sample_buffer[sample_head].phy_page = virt_to_phy(current->mm,data->addr)>>12;
-
-#ifdef DEBUG
-	sample_buffer[sample_head].addr = data->addr;
-	sample_buffer[sample_head].lat = data->weight.full;
-#endif
-
-	/* limit sample index */
-	if(++sample_head > SAMPLES_MAX-1)
-		sample_head = SAMPLES_MAX-1;
-	
-	sample_total++;
+	store_sample(current->mm, data->addr);
 }
 
 void llc_event_wq_callback(struct work_struct *work)
@@ -145,58 +181,69 @@ void llc_event_wq_callback(struct work_struct *work)
 	int cpu;
 	u64 enabled,running;
 	u64 ld_miss;
+	unsigned long flags;
+	bool should_queue_work = false;
 
-	/* If we were sampling, stop sampling and analyze samples */
-	if(sampling){
-		/* stop sampling */
-		for_each_online_cpu(cpu){
-			perf_event_disable(per_cpu(ld_lat_event,cpu));
-			perf_event_disable(per_cpu(precise_str_event,cpu));
-		}
-		sampling = 0;			
-		/* start task that anayzes samples and take action */ 
-		queue_work(action_wq, &task);
-	}							
-	else if(start_sampling){
-		/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
-		l1D_val = 0;
-		for_each_online_cpu(cpu){
-        	l1D_val += perf_event_read_value(per_cpu(l1D_event,cpu), 
-											&enabled, &running);
-		}
-							
-		ld_miss = l1D_val - old_l1D_val;
-						
-		/* Sample loads, stores or both based on LLC load miss count */
-		if(ld_miss >= (miss_total*9)/10){
+	spin_lock_irqsave(&sampling_lock, flags);
+	switch (current_state) {
+		case STATE_SAMPLING: {
+			/* stop sampling */
 			for_each_online_cpu(cpu){
-				perf_event_enable(per_cpu(ld_lat_event,cpu));//sample loads only
+				perf_event_disable(per_cpu(ld_lat_event,cpu));
+				perf_event_disable(per_cpu(precise_str_event,cpu));
 			}
+			current_state = STATE_IDLE;
+			should_queue_work = true;
+			break;
 		}
-
-		else if(ld_miss < miss_total/10){
+		case STATE_ARMED: {
+			/* update MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS value */
+			l1D_val = 0;
 			for_each_online_cpu(cpu){
-				perf_event_enable(per_cpu(precise_str_event,cpu));//sample stores only
+				l1D_val += perf_event_read_value(per_cpu(l1D_event,cpu), 
+									 &enabled, &running);
 			}
-		}
 
-		else{
-			for_each_online_cpu(cpu){
-				/* sample both */
-				perf_event_enable(per_cpu(ld_lat_event,cpu));
-				perf_event_enable(per_cpu(precise_str_event,cpu));
-			}			
+			ld_miss = l1D_val - old_l1D_val;
+
+			// reset samples BEFORE enabling events
+			kfifo_reset(&samples);
+			record_size = 0;
+
+			/* Sample loads, stores or both based on LLC load miss count */
+			if(ld_miss >= (miss_total*9)/10){
+				for_each_online_cpu(cpu){
+					perf_event_enable(per_cpu(ld_lat_event,cpu));//sample loads only
+				}
+			}
+
+			else if(ld_miss < miss_total/10){
+				for_each_online_cpu(cpu){
+					perf_event_enable(per_cpu(precise_str_event,cpu));//sample stores only
+				}
+			}
+
+			else{
+				for_each_online_cpu(cpu){
+					/* sample both */
+					perf_event_enable(per_cpu(ld_lat_event,cpu));
+					perf_event_enable(per_cpu(precise_str_event,cpu));
+				}			
+			}
+
+
+			/* log how many times we passed the threshold */
+			L1_count++;
+			current_state = STATE_SAMPLING;
+			break;
 		}
-							
-		sample_total = 0;
-		record_size = 0;
-		sample_head = 0;
-			
-		/* log how many times we passed the threshold */
-		L1_count++;
-		start_sampling = 0;
-		sampling = 1;
+		default:
+			break;
 	}
+	spin_unlock_irqrestore(&sampling_lock, flags);
+
+	if (should_queue_work)
+		queue_work(action_wq, &task);
 
 	old_l1D_val = l1D_val;
 }
@@ -207,12 +254,20 @@ void action_wq_callback( struct work_struct *work)
 	int rec,log_;
 	unsigned long pfn1,pfn2;
 	unsigned long *virt;
+    size_t sample_total;
 
 	struct page *pg1,*pg2;
 	int i;
 		
+    /* NOTE: Any operations here do NOT need to lock samples_lock:
+     * This workqueue is only queued after sampling is stopped,
+     * so no other code is adding to the samples kfifo at this time. */
+
+	/* Get number of samples before consuming them */
+	sample_total = kfifo_len(&samples);
+
 	/* group samples based on physical pages */
-	build_profile();
+	build_profile(sample_total);
 	/* sort profile, address with highest number
 	of samples first */
     sort(profile,record_size,sizeof(profile_t),profile_compare,NULL);
@@ -220,12 +275,11 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
 	log_=0;
 #endif
-
 	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
 #ifdef DEBUG
-		printk("samples = %u\n",sample_total);
+		printk("samples = %lu\n",sample_total);
 #endif
-		/* calculate hammer threshold */
+	/* calculate hammer threshold */
         hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
 
         /* check for potential agressors */
@@ -233,11 +287,13 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
             profile[rec].hammer = 0;
 #endif
-            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total>= MIN_SAMPLES)){
+            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total >= MIN_SAMPLES)){
 #ifdef DEBUG
                 log_ = 1;
                 profile[rec].hammer = 1;
                 L2_count++;
+                printk("anvil: Potential hammering detected on page %lu with %lu misses\n",
+                        profile[rec].phy_page,profile[rec].llc_total_miss);
 #endif
                 /* potential hammering detected , deploy refresh */
                 for(i=1;i<=REFRESHED_ROWS;i++){
@@ -301,6 +357,7 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 	ktime_t now;
 	u64 enabled,running;
 	int cpu;
+	unsigned long flags;
         
     /* Update llc miss counter value */
 	val = 0;
@@ -310,10 +367,12 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 
 	miss_total = val - old_val;
 	old_val = val;
-	if(!sampling){
+
+	spin_lock_irqsave(&sampling_lock, flags);
+	if(current_state == STATE_IDLE){
 	/* Start sampling if miss rate is high */
 		if(miss_total > LLC_MISS_THRESHOLD){
-			start_sampling = 1;
+			current_state = STATE_ARMED;
 			/* set next interrupt interval for sampling */
 			ktime = ktime_set(0,sample_timer_period);
       		now = hrtimer_cb_get_time(timer); 
@@ -333,6 +392,7 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
      	now = hrtimer_cb_get_time(timer); 
       	hrtimer_forward(&sample_timer,now,ktime);
 	}
+	spin_unlock_irqrestore(&sampling_lock, flags);
 				
 	/* start task that analyzes llc misses */
 	queue_work(llc_event_wq, &task2);
@@ -342,63 +402,49 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 }
 
 /* Groups samples accoriding to accessed physical pages */
-static void build_profile(void)
+static void build_profile(size_t sample_total)
 {
-	int rec,smpl,recorded;
+	int rec;
 	sample_t sample;
+	unsigned long phy_page;
 
-	if(sample_total > 0){
-		sample = sample_buffer[0];
-		profile[0].phy_page 	= sample.phy_page;
-		profile[0].page = (sample.addr);
-		profile[0].llc_total_miss = 1;
-		profile[0].llc_percent_miss = 100;
-		profile[0].cpu 	= sample.cpu;
-		record_size = 1;
-			
-		for(smpl=1; smpl<sample_head; smpl++){
-			sample = sample_buffer[smpl];
+	while (kfifo_get(&samples, &sample)) {
+		phy_page = sample_to_pfn(&sample); 
+		if (!phy_page) {
+			continue;
+		}
 
-			/* see if page already exists */
-			recorded = 0;
-			for(rec=0;rec<record_size;rec++){
-				if((profile[rec].phy_page != 0) && 
-					(profile[rec].phy_page == sample.phy_page)){
-					profile[rec].llc_total_miss++;
-					profile[rec].cpu 	= sample.cpu;
-					recorded = 1;
-					break;
-				}
-			}
-
-			if(!recorded){
-				/* must be new record */
-				/* If there is space in the profile add new record
-				else replace the last one  (The least miss in the profile) */
-				if(record_size < PROFILE_N){
-					profile[record_size].phy_page 	= sample.phy_page;
-					profile[record_size].page = (sample.addr);
-					profile[record_size].llc_total_miss = 1;
-					profile[record_size].cpu = sample.cpu;
-					record_size++;
-				}
-
-				else{
-					profile[record_size - 1].phy_page = sample.phy_page;
-					profile[record_size - 1].page = (sample.addr);
-					profile[record_size - 1].llc_total_miss = 1;
-					profile[record_size - 1].cpu = sample.cpu;
-				}
+		/* see if page already exists in profile */
+		for (rec = 0; rec < record_size; rec++) {
+			if (profile[rec].phy_page == phy_page) {
+				profile[rec].llc_total_miss++;
+				profile[rec].cpu = sample.cpu;
+				break;
 			}
 		}
 
+		if (rec == record_size) {
+			/* new entry */
+			if (record_size < PROFILE_N) {
+				profile[record_size].phy_page = phy_page;
+				profile[record_size].llc_total_miss = 1;
+				profile[record_size].cpu = sample.cpu;
+				record_size++;
+			} else {
+				/* overwrite last entry if full */
+				profile[PROFILE_N - 1].phy_page = phy_page;
+				profile[PROFILE_N - 1].llc_total_miss = 1;
+				profile[PROFILE_N - 1].cpu = sample.cpu;
+			}
+		}
+	}
 #ifdef DEBUG
-		/* calculate percentage */
+	if (sample_total > 0) {
 		for(rec=0;rec<record_size;rec++){
 			profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
 		}
-#endif
 	}
+#endif
 }
 
 /* Sort addresses with higest address distribution first */
@@ -416,6 +462,8 @@ static int start_init(void)
 {
 	int cpu;
     int ret;
+
+    INIT_KFIFO(samples);
 
     ret = detect_and_register_dram_mapping();
     if(ret){
