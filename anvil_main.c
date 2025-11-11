@@ -31,12 +31,40 @@
 #define REFRESHED_ROWS 1
 
 /* Default thresholds and timing (can be overridden via module parameters) */
-unsigned int LLC_MISS_THRESHOLD = 20000;
-module_param(LLC_MISS_THRESHOLD, uint, 0644);
-MODULE_PARM_DESC(LLC_MISS_THRESHOLD, "Threshold of LLC misses before sampling starts");
+unsigned int llc_miss_threshold = 20000;
+module_param(llc_miss_threshold, uint, 0644);
+MODULE_PARM_DESC(llc_miss_threshold, "Threshold of LLC misses before sampling starts");
+
+unsigned int ld_lat_sample_period = 50;
+module_param(ld_lat_sample_period, uint, 0444);
+MODULE_PARM_DESC(ld_lat_sample_period, "Load latency sample period");
+
+unsigned int pre_str_sample_period = 3000;
+module_param(pre_str_sample_period, uint, 0444);
+MODULE_PARM_DESC(pre_str_sample_period, "Precise store sample period");
+
+unsigned int count_timer_period = 6000000;
+module_param(count_timer_period, uint, 0644);
+MODULE_PARM_DESC(count_timer_period, "Count timer period in nanoseconds");
+
+unsigned int sample_timer_period = 6000000;
+module_param(sample_timer_period, uint, 0644);
+MODULE_PARM_DESC(sample_timer_period, "Sample timer period in nanoseconds");
 
 
 MODULE_LICENSE("GPL");
+
+/* LLC miss event attribute */
+struct perf_event_attr llc_miss_event;
+
+/* Load uops that misses LLC */
+struct perf_event_attr l1D_miss_event;
+
+/* Load latency event attribute */
+struct perf_event_attr load_latency_event;
+
+/*precise store event*/
+struct perf_event_attr precise_str_event_attr;
 
 static struct hrtimer sample_timer;
 static ktime_t ktime;
@@ -283,12 +311,12 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
 	log_=0;
 #endif
-	if(miss_total > LLC_MISS_THRESHOLD){//if still  high miss
+	if(miss_total > llc_miss_threshold){//if still  high miss
 #ifdef DEBUG
 		printk("samples = %lu\n",sample_total);
 #endif
 	/* calculate hammer threshold */
-        hammer_threshold = (LLC_MISS_THRESHOLD*sample_total)/miss_total;
+        hammer_threshold = (llc_miss_threshold*sample_total)/miss_total;
 
         /* check for potential agressors */
         for(rec = 0;rec<record_size;rec++){
@@ -379,7 +407,7 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 	spin_lock_irqsave(&sampling_lock, flags);
 	if(current_state == STATE_IDLE){
 	/* Start sampling if miss rate is high */
-		if(miss_total > LLC_MISS_THRESHOLD){
+		if(miss_total > llc_miss_threshold){
 			current_state = STATE_ARMED;
 			/* set next interrupt interval for sampling */
 			ktime = ktime_set(0,sample_timer_period);
@@ -470,6 +498,49 @@ static int start_init(void)
 {
 	int cpu;
     int ret;
+
+    llc_miss_event = (struct perf_event_attr){
+        .type = PERF_TYPE_HARDWARE,
+        .config = PERF_COUNT_HW_CACHE_MISSES,
+        .exclude_user = 0,
+        .exclude_kernel = 1,
+        .pinned = 1,
+    };
+
+    l1D_miss_event = (struct perf_event_attr){
+        .type = PERF_TYPE_RAW,
+        .config = MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS,
+        .exclude_user = 0,
+        .exclude_kernel = 1,
+        .pinned = 1,
+    };
+
+    load_latency_event = (struct perf_event_attr){
+        .type = PERF_TYPE_RAW,
+        .config = LOAD_LATENCY_EVENT,
+        .config1 = 150, //latency?
+        .sample_type = PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_WEIGHT,
+        .sample_period = ld_lat_sample_period,
+        .exclude_user = 0,
+        .exclude_kernel = 1,
+        .precise_ip = 1,
+        .wakeup_events = 1,
+        .disabled = 1,
+        .pinned = 1,
+    };
+
+    precise_str_event_attr = (struct perf_event_attr){
+        .type = PERF_TYPE_RAW,
+        .config = PRECISE_STORE_EVENT,
+        .sample_type = PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC,
+        .sample_period = pre_str_sample_period,
+        .exclude_user = 0,
+        .exclude_kernel = 1,
+        .precise_ip = 1,
+        .wakeup_events = 1,
+        .disabled = 1,
+        .pinned = 1,
+    };
 
     INIT_KFIFO(samples);
 
