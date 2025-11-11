@@ -1,6 +1,6 @@
 
 obj-m += anvil.o
-anvil-objs := anvil_main.o dram_mapping.o intel_dram_mapping.o
+anvil-objs := anvil_main.o dram_mapping.o intel_dram_mapping.o anvil_sysfs.o
 ccflags-y := -O2 
 
 all:
