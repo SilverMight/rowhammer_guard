@@ -1,4 +1,3 @@
-#ifdef DEBUG
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
@@ -67,4 +66,3 @@ void anvil_sysfs_exit(void)
     if (anvil_kobj)
         kobject_put(anvil_kobj);
 }
-#endif
