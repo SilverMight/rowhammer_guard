@@ -328,10 +328,10 @@ void action_wq_callback( struct work_struct *work)
             profile[rec].hammer = 0;
 #endif
             if((profile[rec].llc_total_miss >= (hammer_threshold * aggressor_threshold_percentage) / 100) && (sample_total >= MIN_SAMPLES)){
+				L2_count++;
 #ifdef DEBUG
                 log_ = 1;
                 profile[rec].hammer = 1;
-                L2_count++;
                 printk("anvil: Potential hammering detected on page %lu with %lu misses\n",
                         profile[rec].phy_page,profile[rec].llc_total_miss);
 #endif
@@ -366,9 +366,7 @@ void action_wq_callback( struct work_struct *work)
                 }
 
             }
-#ifdef DEBUG
-            refresh_count++;
-#endif
+			refresh_count++;
         }
     }
 
