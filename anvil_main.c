@@ -23,9 +23,7 @@
 #include <linux/sched/mm.h>
 
 #include "anvil.h"
-#ifdef DEBUG
 #include "dram_mapping.h"
-#endif
 #include "anvil_sysfs.h"
 
 
@@ -475,13 +473,12 @@ static int start_init(void)
 
     INIT_KFIFO(samples);
 
-	#ifdef DEBUG
+	/* insert sysfs entry */
 	ret = anvil_sysfs_init();
 	if (ret) {
 		printk(KERN_ERR "anvil: failed to initialize sysfs interface\n");
 		return ret;
 	}
-	#endif
 
     ret = detect_and_register_dram_mapping();
     if(ret){
@@ -597,10 +594,10 @@ static void finish_exit(void)
   	destroy_workqueue(action_wq);
 	flush_workqueue(llc_event_wq);
   	destroy_workqueue(llc_event_wq);
-
-#ifdef DEBUG
+	/* remove sysfs entry */
 	anvil_sysfs_exit();
 
+#ifdef DEBUG
 	/* Log of ANVIL. CSV of some of the sampled/detected addresses */
 			 
 	printk(">>>>>>>>>>>>>>>>log dump>>>>>>>>>>>>>>>\n");
