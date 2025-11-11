@@ -51,6 +51,10 @@ unsigned int sample_timer_period = 6000000;
 module_param(sample_timer_period, uint, 0644);
 MODULE_PARM_DESC(sample_timer_period, "Sample timer period in nanoseconds");
 
+unsigned int aggressor_threshold_percentage = 50;
+module_param(aggressor_threshold_percentage, uint, 0644);
+MODULE_PARM_DESC(aggressor_threshold_percentage, "Configures the threshold for flagging a memory page as a potential Rowhammer aggressor, specified as a percentage (1-100). A lower percentage makes the detection more aggressive.");
+
 
 MODULE_LICENSE("GPL");
 
@@ -323,7 +327,7 @@ void action_wq_callback( struct work_struct *work)
 #ifdef DEBUG
             profile[rec].hammer = 0;
 #endif
-            if((profile[rec].llc_total_miss >= hammer_threshold/2) && (sample_total >= MIN_SAMPLES)){
+            if((profile[rec].llc_total_miss >= (hammer_threshold * aggressor_threshold_percentage) / 100) && (sample_total >= MIN_SAMPLES)){
 #ifdef DEBUG
                 log_ = 1;
                 profile[rec].hammer = 1;

@@ -22,6 +22,8 @@ extern unsigned int count_timer_period;
 /* sample period  in nanoseconds */
 extern unsigned int sample_timer_period;
 
+extern unsigned int aggressor_threshold_percentage;
+
 /* Maximum number of addresses in the address profile */
 #define PROFILE_N 20
 
