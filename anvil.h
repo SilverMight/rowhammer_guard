@@ -8,21 +8,21 @@
 #define PRECISE_STORE_EVENT 0x02CD
 #define MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS 0x02D4
 
+extern unsigned int llc_miss_threshold;
+
 /* controls load sampling rate */
-#define LD_LAT_SAMPLE_PERIOD 50		
+extern unsigned int ld_lat_sample_period;
 
 /* controls store sampling rate */
-#define PRE_STR_SAMPLE_PERIOD 3000
+extern unsigned int pre_str_sample_period;
 
 /* count period in nanoseconds */
-#define count_timer_period 6000000 	
+extern unsigned int count_timer_period;
 
 /* sample period  in nanoseconds */
-#define sample_timer_period 6000000 					
+extern unsigned int sample_timer_period;
 
-/* last-level cache miss rate threshold
-			that triggers sampling            */
-#define LLC_MISS_THRESHOLD			20000
+extern unsigned int aggressor_threshold_percentage;
 
 /* Maximum number of addresses in the address profile */
 #define PROFILE_N 20
@@ -31,58 +31,16 @@
 #define SAMPLES_MAX 150
 
 /* LLC miss event attribute */
-static struct perf_event_attr llc_miss_event = {
-    .type = PERF_TYPE_HARDWARE,
-    .config = PERF_COUNT_HW_CACHE_MISSES,    
-    .exclude_user  	= 0,      
-    .exclude_kernel = 1,        
-				.pinned = 1,
-};
+extern struct perf_event_attr llc_miss_event;
 
 /* Load uops that misses LLC */
-static struct perf_event_attr l1D_miss_event = {
-    .type =  PERF_TYPE_RAW,
-    .config = MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS,    
-    .exclude_user  	= 0,       
-    .exclude_kernel = 1,        
-				.pinned = 1,
-};
-
+extern struct perf_event_attr l1D_miss_event;
 
 /* Load latency event attribute */
-static struct perf_event_attr load_latency_event = {
-    .type = PERF_TYPE_RAW,
-    .config = LOAD_LATENCY_EVENT, 
-				.config1 = 150, //latency?   
-				.sample_type = 
-																			PERF_SAMPLE_ADDR 				|			//Sample address
-																			PERF_SAMPLE_DATA_SRC | 		//Sample data source 
-																			PERF_SAMPLE_WEIGHT,						//Sample latency in clock cycles
-				.sample_period = 	LD_LAT_SAMPLE_PERIOD, //How many samples before overflow(interrupt)
-    .exclude_user  = 0,        													//count user
-    .exclude_kernel = 1,        												//don't count kernel
-				.precise_ip 				= 1,																				// Enables precise event
-				.wakeup_events 	= 1,																				//overflow on each sample
-				.disabled = 1,
-				.pinned = 1,
-};
+extern struct perf_event_attr load_latency_event;
 
 /*precise store event*/
-static struct perf_event_attr precise_str_event_attr = {
-    .type = PERF_TYPE_RAW,
-    .config = PRECISE_STORE_EVENT,   
-				.sample_type =
-																			PERF_SAMPLE_ADDR 				|		
-																			PERF_SAMPLE_DATA_SRC , 	
-																		
-				.sample_period = 	PRE_STR_SAMPLE_PERIOD, 
-    .exclude_user   = 0,        						
-    .exclude_kernel = 1,        												
-				.precise_ip 				= 1,																				
-				.wakeup_events 	= 1,
-				.disabled 						= 1,
-				.pinned 								= 1,
-};
+extern struct perf_event_attr precise_str_event_attr;
 
 /* Address profile */
 typedef struct{
