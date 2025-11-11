@@ -20,9 +20,8 @@
 /* sample period  in nanoseconds */
 #define sample_timer_period 6000000 					
 
-/* last-level cache miss rate threshold
-			that triggers sampling            */
-#define LLC_MISS_THRESHOLD			20000
+/* last-level cache miss rate threshold that triggers sampling */
+extern unsigned int LLC_MISS_THRESHOLD;
 
 /* Maximum number of addresses in the address profile */
 #define PROFILE_N 20
