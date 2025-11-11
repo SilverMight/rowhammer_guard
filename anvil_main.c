@@ -18,6 +18,9 @@
 #include <linux/delay.h>
 #include <linux/sort.h>
 #include <linux/log2.h>
+#include <linux/mm_types.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -92,21 +95,66 @@ static unsigned long virt_to_phy( struct mm_struct *mm,unsigned long virt)
 {
 	unsigned long phys;
 	struct page *pg;
-	int ret = get_user_pages (
+	int ret;
+
+	mmap_read_lock(mm);
+
+	ret = get_user_pages_remote (
+		mm,
 		virt,
 		1,
-		0,
-		&pg
-        ,NULL
+		FOLL_GET,
+		&pg,
+        NULL,
+		NULL
     );
 
-	if(ret <= 0)
+	mmap_read_unlock(mm);
+
+	if(ret <= 0) {
+		pr_warn(KERN_WARNING "anvil: get_user_pages_remote failed for va: 0x%lx\n", virt);
 		return 0;
+	}
+
 	/* get physical address */
     phys = page_to_phys(pg);
     // Release page, otherwise we will hold the page and never free it
     put_page(pg);
+
 	return phys;
+}
+
+static unsigned long sample_to_pfn(sample_t* sample)
+{
+	unsigned long pfn;
+
+	/* Translate if needed */
+	if (sample->phy_page == 0 && sample->mm) {
+		pfn = virt_to_phy(sample->mm, sample->virt_addr) >> PAGE_SHIFT;
+		mmput(sample->mm); /* Release mm reference */
+	} else {
+		pfn = sample->phy_page >> PAGE_SHIFT;
+	}
+
+	return pfn;
+}
+
+static void store_sample(struct mm_struct* mm,
+						 unsigned long virt_addr)
+{
+	sample_t sample;
+	unsigned long flags;
+
+	if (mm && mmget_not_zero(mm)) {
+		sample.virt_addr = virt_addr;
+		sample.phy_page = 0; // Mark for translation
+		sample.mm = mm;
+		sample.cpu = raw_smp_processor_id();
+
+		spin_lock_irqsave(&samples_lock, flags);
+		kfifo_put(&samples, sample);
+		spin_unlock_irqrestore(&samples_lock, flags);
+	}
 }
 
 /* Interrupt handler for store sample */
@@ -114,18 +162,9 @@ void precise_str_callback(struct perf_event *event,
             				struct perf_sample_data *data,
             				struct pt_regs *regs)
 {
-	sample_t sample;
-	unsigned long flags;
 	/* Check source of store, if local dram (|0x80) record sample */
 	if(data->data_src.val & (1<<7)){
-	
-		sample.phy_page = virt_to_phy(current->mm,data->addr)>>12;
-		if(sample.phy_page > 0){
-			sample.addr = data->addr;
-			spin_lock_irqsave(&samples_lock, flags);
-			kfifo_put(&samples, sample);
-			spin_unlock_irqrestore(&samples_lock, flags);
-		}
+		store_sample(current->mm, data->addr);
 	}
 }
 
@@ -134,17 +173,7 @@ void load_latency_callback(struct perf_event *event,
             struct perf_sample_data *data,
             struct pt_regs *regs)
 {	
-	sample_t sample;
-	unsigned long flags;
-	sample.phy_page = virt_to_phy(current->mm,data->addr)>>12;
-
-#ifdef DEBUG
-	sample.addr = data->addr;
-	sample.lat = data->weight.full;
-#endif
-	spin_lock_irqsave(&samples_lock, flags);
-	kfifo_put(&samples, sample);
-	spin_unlock_irqrestore(&samples_lock, flags);
+	store_sample(current->mm, data->addr);
 }
 
 void llc_event_wq_callback(struct work_struct *work)
@@ -375,60 +404,47 @@ enum hrtimer_restart timer_callback( struct hrtimer *timer )
 /* Groups samples accoriding to accessed physical pages */
 static void build_profile(size_t sample_total)
 {
-	int rec, recorded;
+	int rec;
 	sample_t sample;
+	unsigned long phy_page;
 
-    if (kfifo_get(&samples, &sample)) {
-		profile[0].phy_page 	= sample.phy_page;
-		profile[0].page = (sample.addr);
-		profile[0].llc_total_miss = 1;
-		profile[0].llc_percent_miss = 100;
-		profile[0].cpu 	= sample.cpu;
-		record_size = 1;
-			
-		while(kfifo_get(&samples, &sample)){
-			/* see if page already exists */
-			recorded = 0;
-			for(rec=0;rec<record_size;rec++){
-				if((profile[rec].phy_page != 0) && 
-					(profile[rec].phy_page == sample.phy_page)){
-					profile[rec].llc_total_miss++;
-					profile[rec].cpu 	= sample.cpu;
-					recorded = 1;
-					break;
-				}
-			}
+	while (kfifo_get(&samples, &sample)) {
+		phy_page = sample_to_pfn(&sample); 
+		if (!phy_page) {
+			continue;
+		}
 
-			if(!recorded){
-				/* must be new record */
-				/* If there is space in the profile add new record
-				else replace the last one  (The least miss in the profile) */
-				if(record_size < PROFILE_N){
-					profile[record_size].phy_page 	= sample.phy_page;
-					profile[record_size].page = (sample.addr);
-					profile[record_size].llc_total_miss = 1;
-					profile[record_size].cpu = sample.cpu;
-					record_size++;
-				}
-
-				else{
-					profile[record_size - 1].phy_page = sample.phy_page;
-					profile[record_size - 1].page = (sample.addr);
-					profile[record_size - 1].llc_total_miss = 1;
-					profile[record_size - 1].cpu = sample.cpu;
-				}
+		/* see if page already exists in profile */
+		for (rec = 0; rec < record_size; rec++) {
+			if (profile[rec].phy_page == phy_page) {
+				profile[rec].llc_total_miss++;
+				profile[rec].cpu = sample.cpu;
+				break;
 			}
 		}
 
-#ifdef DEBUG
-		/* calculate percentage */
-		if (sample_total > 0) {
-			for(rec=0;rec<record_size;rec++){
-				profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
+		if (rec == record_size) {
+			/* new entry */
+			if (record_size < PROFILE_N) {
+				profile[record_size].phy_page = phy_page;
+				profile[record_size].llc_total_miss = 1;
+				profile[record_size].cpu = sample.cpu;
+				record_size++;
+			} else {
+				/* overwrite last entry if full */
+				profile[PROFILE_N - 1].phy_page = phy_page;
+				profile[PROFILE_N - 1].llc_total_miss = 1;
+				profile[PROFILE_N - 1].cpu = sample.cpu;
 			}
 		}
-#endif
 	}
+#ifdef DEBUG
+	if (sample_total > 0) {
+		for(rec=0;rec<record_size;rec++){
+			profile[rec].llc_percent_miss = (profile[rec].llc_total_miss*100)/sample_total;
+		}
+	}
+#endif
 }
 
 /* Sort addresses with higest address distribution first */
