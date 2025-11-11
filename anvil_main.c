@@ -23,7 +23,11 @@
 #include <linux/sched/mm.h>
 
 #include "anvil.h"
+#ifdef DEBUG
 #include "dram_mapping.h"
+#endif
+#include "anvil_sysfs.h"
+
 
 #define MIN_SAMPLES 0
 #define REFRESHED_ROWS 1
@@ -50,10 +54,10 @@ static DEFINE_SPINLOCK(samples_lock);
 static DECLARE_KFIFO(samples, sample_t, roundup_pow_of_two(SAMPLES_MAX));
 /* counts number of times L1 threhold was
 passed (sampling was done) */
-static unsigned long L1_count=0;
+unsigned long L1_count=0;
 /* counts number of times hammering was detected */
-static unsigned long L2_count=0;
-static unsigned long refresh_count=0;
+unsigned long L2_count=0;
+unsigned long refresh_count=0;
 static unsigned int hammer_threshold;
 unsigned long dummy;
 
@@ -465,6 +469,14 @@ static int start_init(void)
 
     INIT_KFIFO(samples);
 
+	#ifdef DEBUG
+	ret = anvil_sysfs_init();
+	if (ret) {
+		printk(KERN_ERR "anvil: failed to initialize sysfs interface\n");
+		return ret;
+	}
+	#endif
+
     ret = detect_and_register_dram_mapping();
     if(ret){
             printk(KERN_ERR "Error detecting DRAM mapping\n");
@@ -581,6 +593,8 @@ static void finish_exit(void)
   	destroy_workqueue(llc_event_wq);
 
 #ifdef DEBUG
+	anvil_sysfs_exit();
+
 	/* Log of ANVIL. CSV of some of the sampled/detected addresses */
 			 
 	printk(">>>>>>>>>>>>>>>>log dump>>>>>>>>>>>>>>>\n");
