@@ -32,6 +32,12 @@
 #define MIN_SAMPLES 0
 #define REFRESHED_ROWS 1
 
+/* Default thresholds and timing (can be overridden via module parameters) */
+unsigned int LLC_MISS_THRESHOLD = 20000;
+module_param(LLC_MISS_THRESHOLD, uint, 0644);
+MODULE_PARM_DESC(LLC_MISS_THRESHOLD, "Threshold of LLC misses before sampling starts");
+
+
 MODULE_LICENSE("GPL");
 
 static struct hrtimer sample_timer;
