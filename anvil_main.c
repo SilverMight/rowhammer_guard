@@ -309,7 +309,7 @@ void action_wq_callback( struct work_struct *work)
                         virt = (unsigned long*)kmap(pg1);
                         if(virt){
                             asm volatile("clflush (%0)"::"r"(virt):"memory");
-                            get_user(profile[rec].dummy1,virt);
+                            profile[rec].dummy1 = READ_ONCE(*virt);
                             kunmap(pg1);
                         }
                     }
@@ -319,7 +319,7 @@ void action_wq_callback( struct work_struct *work)
                         virt = (unsigned long*)kmap(pg2);
                         if(virt){
                             asm volatile("clflush (%0)"::"r"(virt):"memory");
-                            get_user(profile[rec].dummy2,virt);
+                            profile[rec].dummy2 = READ_ONCE(*virt);
                             kunmap(pg2);
                         }
                     }
