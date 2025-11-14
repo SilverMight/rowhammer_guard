@@ -1,79 +1,108 @@
-ANVIL uses Intel performance counters to detect rowhammer activity
-and protect potential victim rows by selectively reading from them.
-The process of detecting rowhammering activity is depecited on the flowchart
-(anvil.png).
+# ANVIL: A Rowhammer Detection and Mitigation Kernel Module
 
-ANVIL is implemented as a linux loadable kernel module. It has been tested
-on an Intel Sandy Bridge machine with Ubuntu 14.02 LTS with linux version
-4.0.0. It should work with any Intel processor with Sandy Bridge and later
-microarchitectures. 
+**ANVIL** is a Linux loadable kernel module that leverages hardware performance counters to detect Rowhammer activity and protect vulnerable DRAM rows. When suspicious memory-access patterns are detected—based on cache-miss behavior and sampled load/store addresses—ANVIL proactively refreshes potential victim rows to prevent bit flips.
 
-Configuration 
-==============
+ANVIL has been tested on **Intel systems running Linux kernel 5.1.15**.
 
-There are a number of parameters that can be tuned. The values of the 
-parameters affect accuracy of rowhammer detection and the performance overhead
-on non-hammering applications. All parameters are defined in "anvil.h". Below
-is a description of some of the most important parameters:
+---
 
-count_timer_period : This value is "tc" on the flow chart. It specifies the 
-time period to count the number of last-level cache misses in the first stage 
-of detection. It is given in nanoseconds. The default value is 6ms. It can be 
-lowered for faster detection of rowhammering activity.
+## Overview
 
-sample_timer_period: This value is "ts" on the flow chart. It specifies the time
-period during which load and store samples are taken. It is given in nanoseconds.
-The default value is 6ms. It can be lowered for faster detection of rowhammering 
-activity. If this value is lowered, then the store and load sampling rates might 
-need to be increased to get enough samples.
+ANVIL performs Rowhammer detection in two stages:
 
-LLC_MISS_THRESHOLD: Last-level cache miss threshold. If the LLC miss count for a 
-period of "tc" is greater than this value, then sampling of addresses is triggered. 
-Lowering this value increases accuracy of detection but increases the frequency of 
-sampling which affects performance of non-hammering applictions.
+1. **Monitoring Phase**  
+   The module periodically measures last-level cache (LLC) misses. If LLC activity exceeds `llc_miss_threshold`, address sampling is triggered.
 
-LD_LAT_SAMPLE_PERIOD: This value controls sampling rate of loads. Lowering this value 
-increases the number of load samples within the sampling period. A very low value 
-stresses the system as more interrupts are generated as the sampling rate increases.
+2. **Sampling Phase**  
+   During a short sampling window, ANVIL collects load/store samples using performance counter interrupts. These addresses are mapped to DRAM rows to identify potential aggressor pages. Rows identified as heavily accessed are used to infer potential victim rows, which ANVIL then refreshes by selectively reading from them.
 
-PRE_STR_SAMPLE_PERIOD: This value controls sampling rate of stores. Lowering this value 
-increases the number of store samples within the sampling period. A very low value 
-stresses the system as more interrupts are generated as the sampling rate increases.
-Note that this value is much higher than LD_LAT_SAMPLE_PERIOD. This is because the 
-precise store event samples any stores (those that missed the last-level cache or not).
-Wheter the sample is LLC store miss is checked by software.
+---
 
-Building and Running
-======================
+## Module Parameters
 
-To build the module:
-$make
+ANVIL provides several tunable parameters that allow balancing detection accuracy and system overhead.  
+Parameters can be set at module insertion time, for example:
 
-anvil.ko file is produced from the build
+    insmod anvil.ko llc_miss_threshold=10000
 
-To insert the module:
-$insmod anvil.ko
+### **llc_miss_threshold**
+- **Description:** LLC miss threshold for triggering the sampling phase.  
+- **Effect:** Lower values increase detection accuracy but trigger sampling more often, increasing overhead for benign applications.  
+- **Default:** `20000`
 
-To remove the module:
-$rmmod anvil.ko
+### **count_timer_period**
+- **Description:** Duration (ns) over which LLC misses are counted during the monitoring phase.  
+- **Default:** `6 ms`  
+- **Notes:** Reducing this value speeds up detection.
 
-Compatability
-================
-The module is tested on Intel Sandy Bridge. For later microarchitectures the following event
-number values in "anvil.h" might need to be changed according to the microarchitecture.
-These values can be found on Intel® 64 and IA-32 Architectures Software Developer’s Manual.
+### **sample_timer_period**
+- **Description:** Duration (ns) of the sampling phase in which load/store samples are collected.  
+- **Default:** `6 ms`  
+- **Notes:** A shorter sampling period may require increased sampling rates to collect sufficient data.
 
-LOAD_LATENCY_EVENT
-PRECISE_STORE_EVENT
-MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS
+### **ld_lat_sample_period**
+- **Description:** Sampling rate for load instructions. Lower values increase sampling frequency.  
+- **Default:** `50`  
+- **Notes:** Very low values generate high interrupt rates and may negatively impact system performance.
+
+### **pre_str_sample_period**
+- **Description:** Sampling rate for store instructions.  
+- **Default:** `3000`  
+- **Notes:** Higher than the load sampling rate because precise-store events fire on all stores; the module filters LLC-store-misses in software.
+
+### **aggressor_threshold_percentage**
+- **Description:** Percentage threshold (1–100%) for flagging a memory page as a Rowhammer aggressor.  
+- **Default:** `50%`  
+- **Effect:** Lower thresholds increase sensitivity but may generate false positives.
 
 
-On some machines the sampling facility (PEBS) might require a micro-code upgrade. This can be 
-accomplished by running the following command (for ubuntu).
+## sysfs interface
 
-$sudo apt-get install intel-microcode
+ANVIL exposes runtime statistics and control options via the sysfs interface at `/sys/kernel/anvil/`.
+- **`L1_count`**: Number of times llc_miss_threshold was exceeded.
+- **`L2_count`**: Number of times Rowhammer activity was detected on a page.
+- **`refresh_count`**: Total number of refreshes performed.
 
+---
 
+## Building and Running
 
+### **Build the module**
+    
+    make
 
- 
+### **Insert the module**
+    
+    insmod anvil.ko
+
+### **Remove the module**
+    
+    rmmod anvil.ko
+
+---
+
+## DRAM Memory Mapping
+
+ANVIL includes a flexible DRAM address-mapping layer supporting both Intel and AMD processors. The module automatically detects the processor vendor and applies the correct mapping logic. This enables ANVIL to translate sampled physical addresses into DRAM rows—information essential for identifying aggressors and potential victim rows.
+
+**Currently supported CPU microarchitectures:**
+- **Intel Comet Lake**
+
+To add support for a new architecture, extend the mapping logic in  
+`dram_mapping.h`.
+
+---
+
+## Compatibility Notes
+
+The module is validated on **Intel Comet Lake**.  
+For newer Intel microarchitectures, you may need to update performance-event codes defined in `anvil.h`:
+
+- `LOAD_LATENCY_EVENT`  
+- `PRECISE_STORE_EVENT`  
+- `MEM_LOAD_UOPS_MISC_RETIRED_LLC_MISS`
+
+These values can be found in the **Intel® 64 and IA-32 Architectures Software Developer’s Manual**.
+
+**AMD processors:**  
+AMD uses a different sampling architecture, so supporting AMD systems may require more extensive code modifications.
