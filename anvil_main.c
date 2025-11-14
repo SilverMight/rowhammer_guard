@@ -21,6 +21,7 @@
 #include <linux/mm_types.h>
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
+#include <linux/atomic.h>
 
 #include "anvil.h"
 #include "dram_mapping.h"
@@ -81,8 +82,7 @@ enum sampling_state {
 	STATE_SAMPLING,
 };
 
-static enum sampling_state current_state = STATE_IDLE;
-static DEFINE_SPINLOCK(sampling_lock);
+static atomic_t current_state = ATOMIC_INIT(STATE_IDLE);
 
 static profile_t profile[PROFILE_N];
 static unsigned int record_size;
@@ -224,15 +224,34 @@ void llc_event_wq_callback(struct work_struct *work)
 	unsigned long flags;
 	bool should_queue_work = false;
 
-	spin_lock_irqsave(&sampling_lock, flags);
-	switch (current_state) {
+	/* Update llc miss counter value */
+	val = 0;
+	for_each_online_cpu(cpu){
+		val += perf_event_read_value(per_cpu(llc_event,cpu), &enabled, &running);
+	}
+
+	miss_total = val - old_val;
+	old_val = val;
+
+	if (atomic_read(&current_state) == STATE_IDLE) {
+		/* Start sampling if miss rate is high */
+		if(miss_total > llc_miss_threshold){
+			if (atomic_cmpxchg(&current_state, STATE_IDLE, STATE_ARMED) == STATE_IDLE) {
+				/* set next interrupt interval for sampling */
+				ktime = ktime_set(0,sample_timer_period);
+				hrtimer_start(&sample_timer,ktime,HRTIMER_MODE_REL);
+			}
+		}
+	}
+
+	switch (atomic_read(&current_state)) {
 		case STATE_SAMPLING: {
 			/* stop sampling */
 			for_each_online_cpu(cpu){
 				perf_event_disable(per_cpu(ld_lat_event,cpu));
 				perf_event_disable(per_cpu(precise_str_event,cpu));
 			}
-			current_state = STATE_IDLE;
+			atomic_set(&current_state, STATE_IDLE);
 			should_queue_work = true;
 			break;
 		}
@@ -271,16 +290,14 @@ void llc_event_wq_callback(struct work_struct *work)
 				}			
 			}
 
-
 			/* log how many times we passed the threshold */
 			L1_count++;
-			current_state = STATE_SAMPLING;
+			atomic_set(&current_state, STATE_SAMPLING);
 			break;
 		}
 		default:
 			break;
 	}
-	spin_unlock_irqrestore(&sampling_lock, flags);
 
 	if (should_queue_work)
 		queue_work(action_wq, &task);
@@ -395,48 +412,13 @@ void action_wq_callback( struct work_struct *work)
 enum hrtimer_restart timer_callback( struct hrtimer *timer )
 {
 	ktime_t now;
-	u64 enabled,running;
-	int cpu;
-	unsigned long flags;
         
-    /* Update llc miss counter value */
-	val = 0;
-	for_each_online_cpu(cpu){
-    	val += perf_event_read_value(per_cpu(llc_event,cpu), &enabled, &running);
-	}
-
-	miss_total = val - old_val;
-	old_val = val;
-
-	spin_lock_irqsave(&sampling_lock, flags);
-	if(current_state == STATE_IDLE){
-	/* Start sampling if miss rate is high */
-		if(miss_total > llc_miss_threshold){
-			current_state = STATE_ARMED;
-			/* set next interrupt interval for sampling */
-			ktime = ktime_set(0,sample_timer_period);
-      		now = hrtimer_cb_get_time(timer); 
-      		hrtimer_forward(&sample_timer,now,ktime);
-		}
-
-		else{
-			/* set next interrupt interval for counting */
-			ktime = ktime_set(0,count_timer_period);
-     		now = hrtimer_cb_get_time(timer); 
-      		hrtimer_forward(&sample_timer,now,ktime);
-		}
-	}
-
-	else{
-		ktime = ktime_set(0,count_timer_period);
-     	now = hrtimer_cb_get_time(timer); 
-      	hrtimer_forward(&sample_timer,now,ktime);
-	}
-	spin_unlock_irqrestore(&sampling_lock, flags);
-				
 	/* start task that analyzes llc misses */
 	queue_work(llc_event_wq, &task2);
 
+	now = hrtimer_cb_get_time(timer);
+	hrtimer_forward(timer, now, ktime_set(0, count_timer_period));
+				
 	/* restart timer */
    	return HRTIMER_RESTART;
 }
