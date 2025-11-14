@@ -237,9 +237,6 @@ void llc_event_wq_callback(struct work_struct *work)
 		/* Start sampling if miss rate is high */
 		if(miss_total > llc_miss_threshold){
 			if (atomic_cmpxchg(&current_state, STATE_IDLE, STATE_ARMED) == STATE_IDLE) {
-				/* set next interrupt interval for sampling */
-				ktime = ktime_set(0,sample_timer_period);
-				hrtimer_start(&sample_timer,ktime,HRTIMER_MODE_REL);
 			}
 		}
 	}
@@ -411,14 +408,15 @@ void action_wq_callback( struct work_struct *work)
 /* Timer interrupt handler */
 enum hrtimer_restart timer_callback( struct hrtimer *timer )
 {
-	ktime_t now;
-        
 	/* start task that analyzes llc misses */
 	queue_work(llc_event_wq, &task2);
 
-	now = hrtimer_cb_get_time(timer);
-	hrtimer_forward(timer, now, ktime_set(0, count_timer_period));
-				
+	if (atomic_read(&current_state) == STATE_IDLE) {
+		hrtimer_forward_now(timer, ktime_set(0, count_timer_period));
+	} else {
+		hrtimer_forward_now(timer, ktime_set(0, sample_timer_period));
+	}
+
 	/* restart timer */
    	return HRTIMER_RESTART;
 }
