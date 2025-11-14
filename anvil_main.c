@@ -363,10 +363,12 @@ void action_wq_callback( struct work_struct *work)
                             kunmap(pg2);
                         }
                     }
+
+					// We count each refresh in refresh_count, the row above and below.
+					refresh_count += 2;
                 }
 
             }
-			refresh_count++;
         }
     }
 
